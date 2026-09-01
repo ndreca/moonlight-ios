@@ -14,10 +14,95 @@
 #import "DataManager.h"
 #include "Limelight.h"
 
+#include <math.h>
+#include <stdatomic.h>
+
 @import GameController;
 @import AudioToolbox;
+@import UIKit;
 
 static const double MOUSE_SPEED_DIVISOR = 1.25;
+
+// Keep this enabled in code until there is a user-facing preference for it.
+static const BOOL CONTROLLER_POINTER_MODE_ENABLED_BY_DEFAULT = YES;
+static NSString* const CONTROLLER_POINTER_MODE_PREFERENCE_KEY = @"ControllerPointerModeEnabled";
+static const uint64_t CONTROLLER_POINTER_MODE_HOLD_TIME_MS = 750;
+static const NSTimeInterval CONTROLLER_POINTER_MODE_REPORT_PERIOD = 1.0 / 60.0;
+static const float CONTROLLER_POINTER_MODE_DEADZONE = 0.18f;
+static const float CONTROLLER_POINTER_MODE_MAX_DELTA = 15.0f;
+static const float CONTROLLER_POINTER_MODE_SMOOTHING = 0.42f;
+static const short CONTROLLER_POINTER_MODE_SCROLL_DELTA = 120;
+
+static BOOL MouseButtonOwners[MoonlightMouseButtonSourceCount][BUTTON_X2 + 1];
+static NSUInteger MouseButtonOwnerCounts[BUTTON_X2 + 1];
+static BOOL MouseInputSuspended;
+static _Atomic(uint64_t) LastGCMouseMotionTimeMs;
+
+BOOL MoonlightHasRecentGCMouseMotion(void) {
+    uint64_t lastMotionTimeMs = atomic_load(&LastGCMouseMotionTimeMs);
+    return lastMotionTimeMs != 0 && LiGetMillis() - lastMotionTimeMs < 500;
+}
+
+void MoonlightSendMouseButtonEvent(MoonlightMouseButtonSource source, int action, int button) {
+    if (source >= MoonlightMouseButtonSourceCount || button < BUTTON_LEFT || button > BUTTON_X2) {
+        return;
+    }
+
+    @synchronized([ControllerSupport class]) {
+        BOOL pressed = action == BUTTON_ACTION_PRESS;
+        if (MouseInputSuspended && pressed) {
+            return;
+        }
+        if (pressed == MouseButtonOwners[source][button]) {
+            return;
+        }
+
+        MouseButtonOwners[source][button] = pressed;
+        if (pressed) {
+            if (MouseButtonOwnerCounts[button]++ == 0) {
+                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, button);
+            }
+        }
+        else if (MouseButtonOwnerCounts[button] > 0 && --MouseButtonOwnerCounts[button] == 0) {
+            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, button);
+        }
+    }
+}
+
+void MoonlightReleaseMouseButtons(MoonlightMouseButtonSource source) {
+    if (source >= MoonlightMouseButtonSourceCount) {
+        return;
+    }
+
+    for (int button = BUTTON_LEFT; button <= BUTTON_X2; button++) {
+        MoonlightSendMouseButtonEvent(source, BUTTON_ACTION_RELEASE, button);
+    }
+}
+
+void MoonlightSetMouseInputSuspended(BOOL suspended) {
+    @synchronized([ControllerSupport class]) {
+        MouseInputSuspended = suspended;
+        if (!suspended) {
+            return;
+        }
+
+        for (int button = BUTTON_LEFT; button <= BUTTON_X2; button++) {
+            if (MouseButtonOwnerCounts[button] > 0) {
+                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, button);
+                MouseButtonOwnerCounts[button] = 0;
+            }
+            for (NSUInteger source = 0; source < MoonlightMouseButtonSourceCount; source++) {
+                MouseButtonOwners[source][button] = NO;
+            }
+        }
+    }
+}
+
+@interface ControllerSupport ()
+- (void)updatePointerMouseButton:(int)mouseButton pressed:(BOOL)pressed;
+- (void)autoEnableDesktopPointerForControllerIfNeeded:(Controller *)controller;
+- (BOOL)controllerSupportsReliablePointerToggle:(GCController *)controller;
+@end
 
 @implementation ControllerSupport {
     id _controllerConnectObserver;
@@ -26,17 +111,19 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     id _mouseDisconnectObserver;
     id _keyboardConnectObserver;
     id _keyboardDisconnectObserver;
+    id _applicationWillResignActiveObserver;
+    id _applicationDidBecomeActiveObserver;
     
     NSLock *_controllerStreamLock;
     NSMutableDictionary *_controllers;
-    id<ControllerSupportDelegate> _delegate;
+    __weak id<ControllerSupportDelegate> _delegate;
     
     float accumulatedDeltaX;
     float accumulatedDeltaY;
     float accumulatedScrollX;
     float accumulatedScrollY;
     
-    OnScreenControls *_osc;
+    __weak OnScreenControls *_osc;
     Controller *_oscController;
     
 #define EMULATING_SELECT     0x1
@@ -46,6 +133,14 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     char _controllerNumbers;
     bool _multiController;
     bool _swapABXYButtons;
+    bool _controllerPointerModeAvailable;
+    bool _autoEnableControllerPointerForDesktop;
+    bool _connectionEstablished;
+    bool _hasObservedGCMouseMotion;
+    uint64_t _gcMouseMotionGeneration;
+    bool _cleanupComplete;
+    _Atomic(bool) _inputSuspended;
+    NSUInteger _pointerMouseButtonRefCounts[BUTTON_X2 + 1];
 }
 
 // UPDATE_BUTTON_FLAG(controller, flag, pressed)
@@ -56,7 +151,13 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
 
 -(void) rumble:(unsigned short)controllerNumber lowFreqMotor:(unsigned short)lowFreqMotor highFreqMotor:(unsigned short)highFreqMotor
 {
-    Controller* controller = [_controllers objectForKey:[NSNumber numberWithInteger:controllerNumber]];
+    if (atomic_load_explicit(&_inputSuspended, memory_order_acquire)) {
+        return;
+    }
+    Controller* controller;
+    @synchronized(self) {
+        controller = [_controllers objectForKey:[NSNumber numberWithInteger:controllerNumber]];
+    }
     if (controller == nil && controllerNumber == 0 && _oscEnabled) {
         // TODO: Rumble emulation for OSC
     }
@@ -65,13 +166,24 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
         return;
     }
     
-    [controller.lowFreqMotor setMotorAmplitude:lowFreqMotor];
-    [controller.highFreqMotor setMotorAmplitude:highFreqMotor];
+    @synchronized(controller) {
+        if (atomic_load_explicit(&_inputSuspended, memory_order_acquire)) {
+            return;
+        }
+        [controller.lowFreqMotor setMotorAmplitude:lowFreqMotor];
+        [controller.highFreqMotor setMotorAmplitude:highFreqMotor];
+    }
 }
 
 -(void) rumbleTriggers:(uint16_t)controllerNumber leftTrigger:(uint16_t)leftTrigger rightTrigger:(uint16_t)rightTrigger
 {
-    Controller* controller = [_controllers objectForKey:[NSNumber numberWithInteger:controllerNumber]];
+    if (atomic_load_explicit(&_inputSuspended, memory_order_acquire)) {
+        return;
+    }
+    Controller* controller;
+    @synchronized(self) {
+        controller = [_controllers objectForKey:[NSNumber numberWithInteger:controllerNumber]];
+    }
     if (controller == nil && controllerNumber == 0 && _oscEnabled) {
         // TODO: Trigger rumble emulation for OSC
     }
@@ -80,14 +192,28 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
         return;
     }
     
-    [controller.leftTriggerMotor setMotorAmplitude:leftTrigger];
-    [controller.rightTriggerMotor setMotorAmplitude:rightTrigger];
+    @synchronized(controller) {
+        if (atomic_load_explicit(&_inputSuspended, memory_order_acquire)) {
+            return;
+        }
+        [controller.leftTriggerMotor setMotorAmplitude:leftTrigger];
+        [controller.rightTriggerMotor setMotorAmplitude:rightTrigger];
+    }
 }
 
 - (void) setMotionEventState:(uint16_t)controllerNumber motionType:(uint8_t)motionType reportRateHz:(uint16_t)reportRateHz
 {
+    if (atomic_load_explicit(&_inputSuspended, memory_order_acquire)) {
+        return;
+    }
     if (@available(iOS 14.0, tvOS 14.0, *)) {
-        Controller* controller = [_controllers objectForKey:[NSNumber numberWithInteger:controllerNumber]];
+        Controller* controller;
+        @synchronized(self) {
+            if (atomic_load_explicit(&_inputSuspended, memory_order_acquire)) {
+                return;
+            }
+            controller = [_controllers objectForKey:[NSNumber numberWithInteger:controllerNumber]];
+        }
         if (controller == nil) {
             // No connected controller for this player
             return;
@@ -108,8 +234,14 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
                     GCAcceleration emptyAccelSample = {};
                     controller.lastAccelSample = emptyAccelSample;
                     
-                    dispatch_sync(dispatch_get_main_queue(), ^{
+                    void (^scheduleAccelerometer)(void) = ^{
+                        if (atomic_load_explicit(&self->_inputSuspended, memory_order_acquire)) {
+                            return;
+                        }
                         controller.accelTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / reportRateHz repeats:YES block:^(NSTimer *timer) {
+                            if (atomic_load(&self->_inputSuspended)) {
+                                return;
+                            }
                             // Don't send duplicate samples
                             GCAcceleration lastAccelSample = controller.lastAccelSample;
                             GCAcceleration accelSample = controller.gamepad.motion.acceleration;
@@ -125,7 +257,13 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
                                                         accelSample.y * -9.80665f,
                                                         accelSample.z * -9.80665f);
                         }];
-                    });
+                    };
+                    if (NSThread.isMainThread) {
+                        scheduleAccelerometer();
+                    }
+                    else {
+                        dispatch_sync(dispatch_get_main_queue(), scheduleAccelerometer);
+                    }
                 }
                 break;
                 
@@ -138,8 +276,14 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
                     GCRotationRate emptyGyroSample = {};
                     controller.lastGyroSample = emptyGyroSample;
                     
-                    dispatch_sync(dispatch_get_main_queue(), ^{
+                    void (^scheduleGyroscope)(void) = ^{
+                        if (atomic_load_explicit(&self->_inputSuspended, memory_order_acquire)) {
+                            return;
+                        }
                         controller.gyroTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / reportRateHz repeats:YES block:^(NSTimer *timer) {
+                            if (atomic_load(&self->_inputSuspended)) {
+                                return;
+                            }
                             // Don't send duplicate samples
                             GCRotationRate lastGyroSample = controller.lastGyroSample;
                             GCRotationRate gyroSample = controller.gamepad.motion.rotationRate;
@@ -155,7 +299,13 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
                                                         gyroSample.z * 57.2957795f,
                                                         gyroSample.y * -57.2957795f);
                         }];
-                    });
+                    };
+                    if (NSThread.isMainThread) {
+                        scheduleGyroscope();
+                    }
+                    else {
+                        dispatch_sync(dispatch_get_main_queue(), scheduleGyroscope);
+                    }
                 }
                 break;
         }
@@ -173,8 +323,17 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
 }
 
 -(void) setControllerLed:(uint16_t)controllerNumber r:(uint8_t)r g:(uint8_t)g b:(uint8_t)b {
+    if (atomic_load_explicit(&_inputSuspended, memory_order_acquire)) {
+        return;
+    }
     if (@available(iOS 14.0, tvOS 14.0, *)) {
-        Controller* controller = [_controllers objectForKey:[NSNumber numberWithInteger:controllerNumber]];
+        Controller* controller;
+        @synchronized(self) {
+            if (atomic_load_explicit(&_inputSuspended, memory_order_acquire)) {
+                return;
+            }
+            controller = [_controllers objectForKey:[NSNumber numberWithInteger:controllerNumber]];
+        }
         if (controller == nil) {
             // No connected controller for this player
             return;
@@ -227,6 +386,448 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     }
 }
 
+-(void) notifyControllerPointerModeChanged:(Controller*)controller enabled:(BOOL)enabled
+{
+    if (![_delegate respondsToSelector:@selector(controllerPointerModeChanged:playerIndex:)]) {
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self->_delegate controllerPointerModeChanged:enabled playerIndex:controller.playerIndex];
+    });
+}
+
+-(void) sendNeutralControllerEvent:(Controller*)controller
+{
+    [_controllerStreamLock lock];
+    @synchronized(controller) {
+        if ([self reportControllerArrival:controller]) {
+            LiSendMultiControllerEvent(_multiController ? controller.playerIndex : 0,
+                                       [self getActiveGamepadMask],
+                                       0, 0, 0, 0, 0, 0, 0);
+        }
+    }
+    [_controllerStreamLock unlock];
+}
+
+-(void) releaseControllerPointerButtons:(Controller*)controller
+{
+    int buttonFlags;
+
+    @synchronized(controller) {
+        buttonFlags = controller.pointerModeLastButtonFlags;
+        controller.pointerModeLastButtonFlags = 0;
+    }
+
+    if (buttonFlags & A_FLAG) {
+        [self updatePointerMouseButton:BUTTON_LEFT pressed:NO];
+    }
+    if (buttonFlags & B_FLAG) {
+        [self updatePointerMouseButton:BUTTON_RIGHT pressed:NO];
+    }
+    if (buttonFlags & X_FLAG) {
+        [self updatePointerMouseButton:BUTTON_MIDDLE pressed:NO];
+    }
+    if (buttonFlags & LB_FLAG) {
+        [self updatePointerMouseButton:BUTTON_X1 pressed:NO];
+    }
+    if (buttonFlags & RB_FLAG) {
+        [self updatePointerMouseButton:BUTTON_X2 pressed:NO];
+    }
+}
+
+-(void) updatePointerMouseButton:(int)mouseButton pressed:(BOOL)pressed
+{
+    if (mouseButton < BUTTON_LEFT || mouseButton > BUTTON_X2) {
+        return;
+    }
+
+    @synchronized(self) {
+        NSUInteger previousCount = _pointerMouseButtonRefCounts[mouseButton];
+        if (pressed) {
+            _pointerMouseButtonRefCounts[mouseButton] = previousCount + 1;
+            if (previousCount == 0) {
+                MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceControllerPointer, BUTTON_ACTION_PRESS, mouseButton);
+            }
+        }
+        else if (previousCount > 0) {
+            NSUInteger newCount = previousCount - 1;
+            _pointerMouseButtonRefCounts[mouseButton] = newCount;
+            if (newCount == 0) {
+                MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceControllerPointer, BUTTON_ACTION_RELEASE, mouseButton);
+            }
+        }
+    }
+}
+
+-(void) updateControllerPointerButtons:(Controller*)controller
+{
+    if (atomic_load(&_inputSuspended)) {
+        return;
+    }
+    @synchronized(controller) {
+        if (!controller.pointerModeEnabled) {
+            return;
+        }
+
+        const int pointerButtonMask = A_FLAG | B_FLAG | X_FLAG | LB_FLAG | RB_FLAG |
+                                      UP_FLAG | DOWN_FLAG | LEFT_FLAG | RIGHT_FLAG;
+        int currentButtonFlags = controller.lastButtonFlags & pointerButtonMask;
+        int changedButtonFlags = currentButtonFlags ^ controller.pointerModeLastButtonFlags;
+        controller.pointerModeLastButtonFlags = currentButtonFlags;
+
+#define SEND_POINTER_BUTTON_EDGE(flag, mouseButton) \
+        if (changedButtonFlags & (flag)) { \
+            [self updatePointerMouseButton:(mouseButton) pressed:(currentButtonFlags & (flag)) != 0]; \
+        }
+
+        SEND_POINTER_BUTTON_EDGE(A_FLAG, BUTTON_LEFT);
+        SEND_POINTER_BUTTON_EDGE(B_FLAG, BUTTON_RIGHT);
+        SEND_POINTER_BUTTON_EDGE(X_FLAG, BUTTON_MIDDLE);
+        SEND_POINTER_BUTTON_EDGE(LB_FLAG, BUTTON_X1);
+        SEND_POINTER_BUTTON_EDGE(RB_FLAG, BUTTON_X2);
+
+#undef SEND_POINTER_BUTTON_EDGE
+
+        // Scroll once on each d-pad press edge. This makes app and browser
+        // navigation predictable and avoids key-repeat bursts from controllers.
+        if ((changedButtonFlags & UP_FLAG) && (currentButtonFlags & UP_FLAG)) {
+            LiSendHighResScrollEvent(CONTROLLER_POINTER_MODE_SCROLL_DELTA);
+        }
+        if ((changedButtonFlags & DOWN_FLAG) && (currentButtonFlags & DOWN_FLAG)) {
+            LiSendHighResScrollEvent(-CONTROLLER_POINTER_MODE_SCROLL_DELTA);
+        }
+        if ((changedButtonFlags & RIGHT_FLAG) && (currentButtonFlags & RIGHT_FLAG)) {
+            LiSendHighResHScrollEvent(CONTROLLER_POINTER_MODE_SCROLL_DELTA);
+        }
+        if ((changedButtonFlags & LEFT_FLAG) && (currentButtonFlags & LEFT_FLAG)) {
+            LiSendHighResHScrollEvent(-CONTROLLER_POINTER_MODE_SCROLL_DELTA);
+        }
+    }
+}
+
+-(void) sendControllerPointerMotion:(Controller*)controller
+{
+    if (atomic_load(&_inputSuspended)) {
+        return;
+    }
+    @synchronized(controller) {
+        if (!controller.pointerModeEnabled) {
+            return;
+        }
+
+        float leftX = controller.lastLeftStickX / 32766.0f;
+        float leftY = controller.lastLeftStickY / 32766.0f;
+        float rightX = controller.lastRightStickX / 32766.0f;
+        float rightY = controller.lastRightStickY / 32766.0f;
+
+        float leftMagnitudeSquared = leftX * leftX + leftY * leftY;
+        float rightMagnitudeSquared = rightX * rightX + rightY * rightY;
+        float x = leftMagnitudeSquared >= rightMagnitudeSquared ? leftX : rightX;
+        float y = leftMagnitudeSquared >= rightMagnitudeSquared ? leftY : rightY;
+        float magnitude = hypotf(x, y);
+
+        if (magnitude <= CONTROLLER_POINTER_MODE_DEADZONE) {
+            // Stop immediately in the deadzone so smoothing never produces
+            // cursor drift after the stick returns to center.
+            controller.pointerModeSmoothedDeltaX = 0;
+            controller.pointerModeSmoothedDeltaY = 0;
+            controller.pointerModeAccumulatedDeltaX = 0;
+            controller.pointerModeAccumulatedDeltaY = 0;
+            return;
+        }
+
+        // Remove the radial deadzone, then apply a symmetric cubic response.
+        // This preserves fine control near center while still reaching desktop
+        // traversal speed at the edge of either stick.
+        float normalizedMagnitude = MIN((magnitude - CONTROLLER_POINTER_MODE_DEADZONE) /
+                                        (1.0f - CONTROLLER_POINTER_MODE_DEADZONE), 1.0f);
+        float cubicMagnitude = normalizedMagnitude * normalizedMagnitude * normalizedMagnitude;
+        float scale = CONTROLLER_POINTER_MODE_MAX_DELTA * cubicMagnitude / magnitude;
+
+        float targetDeltaX = x * scale;
+        float targetDeltaY = -y * scale;
+        controller.pointerModeSmoothedDeltaX +=
+            (targetDeltaX - controller.pointerModeSmoothedDeltaX) * CONTROLLER_POINTER_MODE_SMOOTHING;
+        controller.pointerModeSmoothedDeltaY +=
+            (targetDeltaY - controller.pointerModeSmoothedDeltaY) * CONTROLLER_POINTER_MODE_SMOOTHING;
+
+        controller.pointerModeAccumulatedDeltaX += controller.pointerModeSmoothedDeltaX;
+        controller.pointerModeAccumulatedDeltaY += controller.pointerModeSmoothedDeltaY;
+
+        short deltaX = (short)truncf(controller.pointerModeAccumulatedDeltaX);
+        short deltaY = (short)truncf(controller.pointerModeAccumulatedDeltaY);
+
+        if (deltaX != 0 || deltaY != 0) {
+            LiSendMouseMoveEvent(deltaX, deltaY);
+            controller.pointerModeAccumulatedDeltaX -= deltaX;
+            controller.pointerModeAccumulatedDeltaY -= deltaY;
+        }
+    }
+}
+
+-(void) startControllerPointerTimer:(Controller*)controller
+{
+    void (^startTimer)(void) = ^{
+        if (atomic_load_explicit(&self->_inputSuspended, memory_order_acquire)) {
+            return;
+        }
+        @synchronized(controller) {
+            if (!controller.pointerModeEnabled || controller.pointerModeTimer != nil) {
+                return;
+            }
+
+            __weak ControllerSupport* weakSelf = self;
+            __weak Controller* weakController = controller;
+            controller.pointerModeTimer = [NSTimer timerWithTimeInterval:CONTROLLER_POINTER_MODE_REPORT_PERIOD
+                                                                  repeats:YES
+                                                                    block:^(NSTimer *timer) {
+                ControllerSupport* strongSelf = weakSelf;
+                Controller* strongController = weakController;
+                if (strongSelf == nil || strongController == nil) {
+                    [timer invalidate];
+                    return;
+                }
+
+                [strongSelf sendControllerPointerMotion:strongController];
+            }];
+            [[NSRunLoop mainRunLoop] addTimer:controller.pointerModeTimer forMode:NSRunLoopCommonModes];
+        }
+    };
+
+    if ([NSThread isMainThread]) {
+        startTimer();
+    }
+    else {
+        dispatch_async(dispatch_get_main_queue(), startTimer);
+    }
+}
+
+-(void) stopControllerPointerTimer:(Controller*)controller
+{
+    NSTimer* timer;
+
+    @synchronized(controller) {
+        timer = controller.pointerModeTimer;
+        controller.pointerModeTimer = nil;
+    }
+
+    // NSTimer permits invalidation from any thread. Clearing the property first
+    // also prevents a queued main-thread start from surviving teardown.
+    [timer invalidate];
+}
+
+-(void) setControllerPointerMode:(Controller*)controller enabled:(BOOL)enabled notifyDelegate:(BOOL)notifyDelegate
+{
+    if (enabled && atomic_load_explicit(&_inputSuspended, memory_order_acquire)) {
+        return;
+    }
+    BOOL changed;
+
+    @synchronized(controller) {
+        changed = controller.pointerModeEnabled != enabled;
+        controller.pointerModeEnabled = enabled;
+        controller.pointerModeAccumulatedDeltaX = 0;
+        controller.pointerModeAccumulatedDeltaY = 0;
+        controller.pointerModeSmoothedDeltaX = 0;
+        controller.pointerModeSmoothedDeltaY = 0;
+    }
+
+    if (enabled) {
+        if (!changed) {
+            return;
+        }
+
+        // Explicitly release the virtual gamepad before suppressing packets from
+        // this controller, otherwise held controls can remain stuck on the host.
+        [self sendNeutralControllerEvent:controller];
+        [self startControllerPointerTimer:controller];
+    }
+    else {
+        // Always perform teardown, even when state already says disabled. This
+        // makes disconnect, cleanup, and app-background paths idempotent.
+        [self stopControllerPointerTimer:controller];
+        [self releaseControllerPointerButtons:controller];
+    }
+
+    if (changed && notifyDelegate) {
+        [self notifyControllerPointerModeChanged:controller enabled:enabled];
+    }
+}
+
+-(void) autoEnableDesktopPointerForControllerIfNeeded:(Controller *)controller
+{
+    if (!_connectionEstablished ||
+        !_autoEnableControllerPointerForDesktop ||
+        atomic_load(&_inputSuspended) ||
+        controller == nil) {
+        return;
+    }
+
+    // Reliable Menu controllers use the hold gesture. Controllers represented
+    // by iOS as a single-event MFi profile use controllerPausedHandler below as
+    // an immediate Desktop-only toggle.
+    if (controller.gamepad.extendedGamepad == nil) {
+        return;
+    }
+
+    // Desktop is mouse-first, but only one controller should own the pointer.
+    // Other connected controllers continue forwarding normal gamepad packets.
+    for (Controller *existingController in [_controllers allValues]) {
+        @synchronized(existingController) {
+            if (existingController.pointerModeEnabled) {
+                return;
+            }
+        }
+    }
+
+    [self setControllerPointerMode:controller enabled:YES notifyDelegate:YES];
+}
+
+-(void) resetControllerPointerMode:(Controller*)controller notifyDelegate:(BOOL)notifyDelegate
+{
+    BOOL releaseForwardedMenu;
+    @synchronized(controller) {
+        releaseForwardedMenu = controller.pointerModeMenuPressed || (controller.lastButtonFlags & PLAY_FLAG) != 0;
+        controller.pointerModeMenuPressed = NO;
+        controller.pointerModeToggleEligible = NO;
+        controller.pointerModeMenuDownTimeMs = 0;
+        controller.pointerModeHoldGeneration++;
+        controller.pointerModeHoldActivated = NO;
+        controller.pointerModeMenuPulseGeneration++;
+        controller.pointerModeMenuPulseActive = NO;
+    }
+
+    if (releaseForwardedMenu) {
+        [self clearButtonFlag:controller flags:PLAY_FLAG];
+        [self sendNeutralControllerEvent:controller];
+    }
+
+    [self setControllerPointerMode:controller enabled:NO notifyDelegate:notifyDelegate];
+}
+
+-(BOOL) isControllerNeutralForPointerToggle:(Controller*)controller
+{
+    return controller.lastButtonFlags == 0 &&
+           controller.lastLeftTrigger < 8 &&
+           controller.lastRightTrigger < 8;
+}
+
+-(BOOL) updateControllerPointerModeToggle:(Controller*)controller menuPressed:(BOOL)menuPressed
+{
+    BOOL shouldToggle = NO;
+    BOOL enablePointerMode = NO;
+    BOOL forwardMenuDown = NO;
+    BOOL forwardMenuUp = NO;
+    BOOL emitShortMenuTap = NO;
+    BOOL scheduleHoldActivation = NO;
+    uint64_t holdGeneration = 0;
+
+    @synchronized(controller) {
+        if (menuPressed != controller.pointerModeMenuPressed) {
+            controller.pointerModeMenuPressed = menuPressed;
+
+            if (menuPressed) {
+                if (controller.pointerModeMenuPulseActive) {
+                    controller.pointerModeMenuPulseActive = NO;
+                    controller.pointerModeMenuPulseGeneration++;
+                }
+
+                // Start/Menu is a toggle gesture, not a chord with the sticks.
+                // Ignore stick position and allow the user to begin moving as
+                // soon as the hold threshold enables pointer mode.
+                controller.pointerModeToggleEligible = [self isControllerNeutralForPointerToggle:controller];
+                controller.pointerModeMenuDownTimeMs = LiGetMillis();
+                controller.pointerModeHoldActivated = NO;
+                holdGeneration = ++controller.pointerModeHoldGeneration;
+                scheduleHoldActivation = controller.pointerModeToggleEligible;
+                forwardMenuDown = !controller.pointerModeToggleEligible;
+            }
+            else if (controller.pointerModeHoldActivated) {
+                // The scheduled hold already toggled mode. Releasing Menu must
+                // not emit a delayed Start press to the host.
+                controller.pointerModeHoldActivated = NO;
+                controller.pointerModeToggleEligible = NO;
+                controller.pointerModeMenuDownTimeMs = 0;
+                controller.pointerModeHoldGeneration++;
+            }
+            else {
+                uint64_t heldTimeMs = LiGetMillis() - controller.pointerModeMenuDownTimeMs;
+                shouldToggle = controller.pointerModeToggleEligible &&
+                               heldTimeMs >= CONTROLLER_POINTER_MODE_HOLD_TIME_MS;
+                enablePointerMode = !controller.pointerModeEnabled;
+                emitShortMenuTap = controller.pointerModeToggleEligible && !shouldToggle;
+                forwardMenuUp = !controller.pointerModeToggleEligible;
+                controller.pointerModeToggleEligible = NO;
+                controller.pointerModeMenuDownTimeMs = 0;
+                controller.pointerModeHoldGeneration++;
+            }
+        }
+        else if (menuPressed && controller.pointerModeToggleEligible &&
+                 ![self isControllerNeutralForPointerToggle:controller]) {
+            // A real digital/trigger chord cancels the pointer shortcut and
+            // forwards Menu immediately. Stick movement alone never cancels.
+            controller.pointerModeToggleEligible = NO;
+            controller.pointerModeHoldGeneration++;
+            forwardMenuDown = YES;
+        }
+    }
+
+    if (scheduleHoldActivation) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(CONTROLLER_POINTER_MODE_HOLD_TIME_MS * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            BOOL activate = NO;
+            BOOL enabled = NO;
+            @synchronized(controller) {
+                if (controller.pointerModeMenuPressed &&
+                    controller.pointerModeToggleEligible &&
+                    !controller.pointerModeHoldActivated &&
+                    controller.pointerModeHoldGeneration == holdGeneration) {
+                    controller.pointerModeHoldActivated = YES;
+                    controller.pointerModeToggleEligible = NO;
+                    enabled = !controller.pointerModeEnabled;
+                    activate = YES;
+                }
+            }
+            if (activate) {
+                [self setControllerPointerMode:controller enabled:enabled notifyDelegate:YES];
+            }
+        });
+    }
+
+    if (forwardMenuDown) {
+        [self setButtonFlag:controller flags:PLAY_FLAG];
+    }
+    if (emitShortMenuTap) {
+        uint64_t pulseGeneration;
+        @synchronized(controller) {
+            pulseGeneration = ++controller.pointerModeMenuPulseGeneration;
+            controller.pointerModeMenuPulseActive = YES;
+        }
+        [self setButtonFlag:controller flags:PLAY_FLAG];
+        [self updateFinished:controller];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(75 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            @synchronized(controller) {
+                if (!controller.pointerModeMenuPulseActive ||
+                    controller.pointerModeMenuPulseGeneration != pulseGeneration) {
+                    return;
+                }
+                controller.pointerModeMenuPulseActive = NO;
+            }
+            [self clearButtonFlag:controller flags:PLAY_FLAG];
+            [self updateFinished:controller];
+        });
+    }
+    if (forwardMenuUp) {
+        [self clearButtonFlag:controller flags:PLAY_FLAG];
+    }
+    if (shouldToggle) {
+        [self setControllerPointerMode:controller enabled:enablePointerMode notifyDelegate:YES];
+    }
+    return emitShortMenuTap;
+}
 -(void) handleSpecialCombosReleased:(Controller*)controller releasedButtons:(int)releasedButtons
 {
     if ((controller.emulatingButtonFlags & EMULATING_SELECT) && (releasedButtons & (LB_FLAG | PLAY_FLAG))) {
@@ -330,11 +931,14 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
         // Handle Start+Select+L1+R1 gamepad quit combo
         if (controller.lastButtonFlags == (PLAY_FLAG | BACK_FLAG | LB_FLAG | RB_FLAG)) {
             controller.lastButtonFlags = 0;
+            controller.pointerModeToggleEligible = NO;
             exitRequested = YES;
         }
         
         // Only send controller events if we successfully reported controller arrival
-        if ([self reportControllerArrival:controller]) {
+        if (!atomic_load(&_inputSuspended) && [self reportControllerArrival:controller] && !controller.pointerModeEnabled) {
+            // Pointer mode suppresses packets only from the controller that owns
+            // it. Other physical controllers and OSC input continue normally.
             uint32_t buttonFlags = controller.lastButtonFlags;
             uint8_t leftTrigger = controller.lastLeftTrigger;
             uint8_t rightTrigger = controller.lastRightTrigger;
@@ -344,7 +948,7 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
             int16_t rightStickY = controller.lastRightStickY;
             
             // If this is merged with another controller, combine the inputs
-            if (controller.mergedWithController) {
+            if (controller.mergedWithController && !controller.mergedWithController.pointerModeEnabled) {
                 buttonFlags |= controller.mergedWithController.lastButtonFlags;
                 leftTrigger = MAX(leftTrigger, controller.mergedWithController.lastLeftTrigger);
                 rightTrigger = MAX(rightTrigger, controller.mergedWithController.lastRightTrigger);
@@ -363,6 +967,8 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     [_controllerStreamLock unlock];
     
     if (exitRequested) {
+        [self resetControllerPointerMode:controller notifyDelegate:NO];
+
         // Invoke the delegate callback on the main thread
         dispatch_async(dispatch_get_main_queue(), ^{
             [self->_delegate streamExitRequested];
@@ -410,10 +1016,12 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
 
 -(void) cleanupControllerHaptics:(Controller*) controller
 {
-    [controller.lowFreqMotor cleanup];
-    [controller.highFreqMotor cleanup];
-    [controller.leftTriggerMotor cleanup];
-    [controller.rightTriggerMotor cleanup];
+    @synchronized(controller) {
+        [controller.lowFreqMotor cleanup];
+        [controller.highFreqMotor cleanup];
+        [controller.leftTriggerMotor cleanup];
+        [controller.rightTriggerMotor cleanup];
+    }
 }
 
 -(void) cleanupControllerMotion:(Controller*) controller
@@ -436,6 +1044,9 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
         if (controller.gamepad.battery) {
             // Poll for updated battery status every 30 seconds
             controller.batteryTimer = [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *timer) {
+                if (atomic_load_explicit(&self->_inputSuspended, memory_order_acquire)) {
+                    return;
+                }
                 if (controller.lastBatteryState != controller.gamepad.battery.batteryState ||
                     controller.lastBatteryLevel != controller.gamepad.battery.batteryLevel) {
                     uint8_t batteryState;
@@ -640,6 +1251,31 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
 -(void) handleControllerTouchpad:(Controller*)controller touch:(GCControllerDirectionPad*)touch index:(int)index
 {
     controller_touch_context_t context = index == 0 ? controller.primaryTouch : controller.secondaryTouch;
+    BOOL needsLift = index == 0 ? controller.primaryTouchNeedsLift : controller.secondaryTouchNeedsLift;
+
+    if (atomic_load(&_inputSuspended)) {
+        if (index == 0) {
+            controller.primaryTouch = (controller_touch_context_t){ 0, 0 };
+            controller.primaryTouchNeedsLift = touch.xAxis.value != 0 || touch.yAxis.value != 0;
+        }
+        else {
+            controller.secondaryTouch = (controller_touch_context_t){ 0, 0 };
+            controller.secondaryTouchNeedsLift = touch.xAxis.value != 0 || touch.yAxis.value != 0;
+        }
+        return;
+    }
+
+    if (needsLift) {
+        if (!touch.xAxis.value && !touch.yAxis.value) {
+            if (index == 0) {
+                controller.primaryTouchNeedsLift = NO;
+            }
+            else {
+                controller.secondaryTouchNeedsLift = NO;
+            }
+        }
+        return;
+    }
     
     // This magic is courtesy of SDL
     float normalizedX = (1.0f + touch.xAxis.value) * 0.5f;
@@ -676,6 +1312,58 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     }
 }
 
+-(void) releaseControllerTouchpadTouches:(Controller*)controller
+{
+    controller_touch_context_t primary;
+    controller_touch_context_t secondary;
+    @synchronized(controller) {
+        primary = controller.primaryTouch;
+        secondary = controller.secondaryTouch;
+        controller.primaryTouch = (controller_touch_context_t){ 0, 0 };
+        controller.secondaryTouch = (controller_touch_context_t){ 0, 0 };
+        controller.primaryTouchNeedsLift = primary.lastX != 0 || primary.lastY != 0;
+        controller.secondaryTouchNeedsLift = secondary.lastX != 0 || secondary.lastY != 0;
+    }
+
+    controller_touch_context_t touches[] = { primary, secondary };
+    for (int index = 0; index < 2; index++) {
+        if (touches[index].lastX || touches[index].lastY) {
+            float normalizedX = (1.0f + touches[index].lastX) * 0.5f;
+            float normalizedY = 1.0f - (1.0f + touches[index].lastY) * 0.5f;
+            LiSendControllerTouchEvent(controller.playerIndex,
+                                       LI_TOUCH_EVENT_UP,
+                                       index,
+                                       normalizedX,
+                                       normalizedY,
+                                       1.0f);
+        }
+    }
+}
+
+-(BOOL) controllerSupportsReliablePointerToggle:(GCController *)controller
+{
+    if (@available(iOS 13.0, tvOS 13.0, *)) {
+        GCExtendedGamepad *gamepad = controller.extendedGamepad;
+        if (gamepad == nil || gamepad.buttonMenu == nil) {
+            return NO;
+        }
+        if (gamepad.buttonOptions != nil) {
+            return YES;
+        }
+
+        // Some modern Xbox/PlayStation controllers expose a reliable Menu
+        // down/up input through the simulator even when Options is omitted.
+        NSString *identity = [NSString stringWithFormat:@"%@ %@",
+                              controller.vendorName ?: @"",
+                              controller.productCategory ?: @""].lowercaseString;
+        return [identity containsString:@"xbox"] ||
+               [identity containsString:@"playstation"] ||
+               [identity containsString:@"dualshock"] ||
+               [identity containsString:@"dualsense"];
+    }
+    return NO;
+}
+
 -(void) registerControllerCallbacks:(GCController*) controller
 {
     if (controller != NULL) {
@@ -685,17 +1373,44 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
         // To work around this issue, use the old controllerPausedHandler if the controller
         // doesn't have a Select button (which indicates it probably doesn't have a proper
         // Start button either).
-        BOOL useLegacyPausedHandler = YES;
-        if (@available(iOS 13.0, tvOS 13.0, *)) {
-            if (controller.extendedGamepad != nil &&
-                controller.extendedGamepad.buttonOptions != nil) {
-                useLegacyPausedHandler = NO;
-            }
-        }
+        BOOL reliablePointerToggle = [self controllerSupportsReliablePointerToggle:controller];
+        BOOL usePausedHandlerFallback = !reliablePointerToggle;
+        Log(LOG_I, @"Controller profile: %@ (%@), Menu: %d, Options: %d, hold toggle: %d",
+            controller.vendorName ?: @"Unknown",
+            controller.productCategory ?: @"Unknown",
+            controller.extendedGamepad.buttonMenu != nil,
+            controller.extendedGamepad.buttonOptions != nil,
+            reliablePointerToggle);
         
-        if (useLegacyPausedHandler) {
+        if (usePausedHandlerFallback) {
             controller.controllerPausedHandler = ^(GCController *controller) {
                 Controller* limeController = [self->_controllers objectForKey:[NSNumber numberWithInteger:controller.playerIndex]];
+                if (limeController == nil || limeController.gamepad != controller) {
+                    return;
+                }
+
+                if (self->_autoEnableControllerPointerForDesktop &&
+                    self->_connectionEstablished &&
+                    !atomic_load(&self->_inputSuspended)) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (atomic_load_explicit(&self->_inputSuspended, memory_order_acquire)) {
+                            return;
+                        }
+                        Controller *currentController =
+                            [self->_controllers objectForKey:@(limeController.playerIndex)];
+                        if (currentController != limeController || limeController.gamepad != controller) {
+                            return;
+                        }
+                        BOOL enablePointerMode;
+                        @synchronized(limeController) {
+                            enablePointerMode = !limeController.pointerModeEnabled;
+                        }
+                        [self setControllerPointerMode:limeController
+                                               enabled:enablePointerMode
+                                        notifyDelegate:YES];
+                    });
+                    return;
+                }
                 
                 // Get off the main thread
                 dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
@@ -722,9 +1437,15 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
             
             controller.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *gamepad, GCControllerElement *element) {
                 Controller* limeController = [self->_controllers objectForKey:[NSNumber numberWithInteger:gamepad.controller.playerIndex]];
+                if (limeController == nil || limeController.gamepad != gamepad.controller) {
+                    return;
+                }
                 short leftStickX, leftStickY;
                 short rightStickX, rightStickY;
                 unsigned char leftTrigger, rightTrigger;
+                BOOL canTogglePointerMode = NO;
+                BOOL menuPressed = NO;
+                BOOL menuPulseDeferred = NO;
                 
                 if (self->_swapABXYButtons) {
                     UPDATE_BUTTON_FLAG(limeController, B_FLAG, gamepad.buttonA.pressed);
@@ -758,13 +1479,21 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
                 }
                 
                 if (@available(iOS 13.0, tvOS 13.0, *)) {
-                    // Options button is optional (only present on Xbox One S and PS4 gamepads)
+                    // Options/Select is independent from Start/Menu.
                     if (gamepad.buttonOptions != nil) {
                         UPDATE_BUTTON_FLAG(limeController, BACK_FLAG, gamepad.buttonOptions.pressed);
+                    }
 
-                        // For older MFi gamepads, the menu button will already be handled by
-                        // the controllerPausedHandler.
-                        UPDATE_BUTTON_FLAG(limeController, PLAY_FLAG, gamepad.buttonMenu.pressed);
+                    // Single-event MFi profiles use controllerPausedHandler
+                    // because they don't provide a reliable Menu down/up pair.
+                    if (!usePausedHandlerFallback) {
+                        if (self->_controllerPointerModeAvailable) {
+                            canTogglePointerMode = YES;
+                            menuPressed = gamepad.buttonMenu.pressed;
+                        }
+                        else {
+                            UPDATE_BUTTON_FLAG(limeController, PLAY_FLAG, gamepad.buttonMenu.pressed);
+                        }
                     }
                 }
                 
@@ -821,7 +1550,15 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
                 [self updateLeftStick:limeController x:leftStickX y:leftStickY];
                 [self updateRightStick:limeController x:rightStickX y:rightStickY];
                 [self updateTriggers:limeController left:leftTrigger right:rightTrigger];
-                [self updateFinished:limeController];
+
+                if (canTogglePointerMode && !atomic_load(&self->_inputSuspended)) {
+                    menuPulseDeferred = [self updateControllerPointerModeToggle:limeController menuPressed:menuPressed];
+                }
+
+                if (!menuPulseDeferred) {
+                    [self updateFinished:limeController];
+                }
+                [self updateControllerPointerButtons:limeController];
             };
         }
     } else {
@@ -839,6 +1576,12 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     for (GCControllerButtonInput* auxButton in mouse.mouseInput.auxiliaryButtons) {
         auxButton.pressedChangedHandler = nil;
     }
+    MoonlightReleaseMouseButtons(MoonlightMouseButtonSourcePhysicalMouse);
+    @synchronized(self) {
+        _hasObservedGCMouseMotion = false;
+        _gcMouseMotionGeneration++;
+    }
+    atomic_store(&LastGCMouseMotionTimeMs, 0);
     
 #if TARGET_OS_TV
     mouse.mouseInput.scroll.xAxis.valueChangedHandler = nil;
@@ -848,6 +1591,33 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
 
 -(void) registerMouseCallbacks:(GCMouse*) mouse API_AVAILABLE(ios(14.0)) {
     mouse.mouseInput.mouseMovedHandler = ^(GCMouseInput * _Nonnull mouse, float deltaX, float deltaY) {
+        if (atomic_load(&self->_inputSuspended)) {
+            return;
+        }
+        atomic_store(&LastGCMouseMotionTimeMs, LiGetMillis());
+        BOOL notifyPointerLock = NO;
+        uint64_t motionGeneration;
+        @synchronized(self) {
+            notifyPointerLock = !self->_hasObservedGCMouseMotion;
+            self->_hasObservedGCMouseMotion = true;
+            motionGeneration = ++self->_gcMouseMotionGeneration;
+        }
+        if (notifyPointerLock) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self->_delegate mousePresenceChanged];
+            });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(550 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            @synchronized(self) {
+                if (self->_gcMouseMotionGeneration != motionGeneration ||
+                    MoonlightHasRecentGCMouseMotion()) {
+                    return;
+                }
+                self->_hasObservedGCMouseMotion = false;
+            }
+            [self->_delegate mousePresenceChanged];
+        });
         self->accumulatedDeltaX += deltaX / MOUSE_SPEED_DIVISOR;
         self->accumulatedDeltaY += -deltaY / MOUSE_SPEED_DIVISOR;
         
@@ -863,24 +1633,29 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     };
     
     mouse.mouseInput.leftButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
-        LiSendMouseButtonEvent(pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+        if (atomic_load(&self->_inputSuspended)) return;
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourcePhysicalMouse, pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, BUTTON_LEFT);
     };
     mouse.mouseInput.middleButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
-        LiSendMouseButtonEvent(pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, BUTTON_MIDDLE);
+        if (atomic_load(&self->_inputSuspended)) return;
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourcePhysicalMouse, pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, BUTTON_MIDDLE);
     };
     mouse.mouseInput.rightButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
-        LiSendMouseButtonEvent(pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+        if (atomic_load(&self->_inputSuspended)) return;
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourcePhysicalMouse, pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
     };
     
     if (mouse.mouseInput.auxiliaryButtons != nil) {
         if (mouse.mouseInput.auxiliaryButtons.count >= 1) {
             mouse.mouseInput.auxiliaryButtons[0].pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
-                LiSendMouseButtonEvent(pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, BUTTON_X1);
+                if (atomic_load(&self->_inputSuspended)) return;
+                MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourcePhysicalMouse, pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, BUTTON_X1);
             };
         }
         if (mouse.mouseInput.auxiliaryButtons.count >= 2) {
             mouse.mouseInput.auxiliaryButtons[1].pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
-                LiSendMouseButtonEvent(pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, BUTTON_X2);
+                if (atomic_load(&self->_inputSuspended)) return;
+                MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourcePhysicalMouse, pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, BUTTON_X2);
             };
         }
     }
@@ -891,6 +1666,7 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     // GCMouse for mice, so we will have to just use it and hope for the best.
 #if TARGET_OS_TV
     mouse.mouseInput.scroll.xAxis.valueChangedHandler = ^(GCControllerAxisInput * _Nonnull axis, float value) {
+        if (atomic_load(&self->_inputSuspended)) return;
         self->accumulatedScrollX += value;
         
         short truncatedScrollX = (short)self->accumulatedScrollX;
@@ -903,6 +1679,7 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
         }
     };
     mouse.mouseInput.scroll.yAxis.valueChangedHandler = ^(GCControllerAxisInput * _Nonnull axis, float value) {
+        if (atomic_load(&self->_inputSuspended)) return;
         self->accumulatedScrollY += value;
         
         short truncatedScrollY = (short)self->accumulatedScrollY;
@@ -1079,16 +1856,28 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     
     _controllerStreamLock = [[NSLock alloc] init];
     _controllers = [[NSMutableDictionary alloc] init];
+    atomic_init(&_inputSuspended, false);
+    MoonlightSetMouseInputSuspended(NO);
     _controllerNumbers = 0;
     _multiController = streamConfig.multiController;
     _swapABXYButtons = streamConfig.swapABXYButtons;
+    NSNumber *pointerModePreference = [NSUserDefaults.standardUserDefaults objectForKey:CONTROLLER_POINTER_MODE_PREFERENCE_KEY];
+    _controllerPointerModeAvailable = pointerModePreference != nil
+        ? pointerModePreference.boolValue
+        : CONTROLLER_POINTER_MODE_ENABLED_BY_DEFAULT;
+    _autoEnableControllerPointerForDesktop =
+        _controllerPointerModeAvailable &&
+        streamConfig.appName != nil &&
+        [streamConfig.appName rangeOfString:@"desktop" options:NSCaseInsensitiveSearch].location != NSNotFound;
     _delegate = delegate;
 
     _oscController = [[Controller alloc] init];
     _oscController.playerIndex = 0;
 
     DataManager* dataMan = [[DataManager alloc] init];
-    _oscEnabled = (OnScreenControlsLevel)[[dataMan getSettings].onscreenControls integerValue] != OnScreenControlsLevelOff;
+    TemporarySettings *settings = [dataMan getSettings];
+    _oscEnabled = !settings.absoluteTouchMode &&
+        (OnScreenControlsLevel)[settings.onscreenControls integerValue] != OnScreenControlsLevelOff;
     
     Log(LOG_I, @"Number of supported controllers connected: %d", [ControllerSupport getGamepadCount]);
     Log(LOG_I, @"Multi-controller: %d", _multiController);
@@ -1125,7 +1914,10 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
             [self registerControllerCallbacks:controller];
             
             // Report the controller arrival to the host if we're connected
-            [self reportControllerArrival:limeController];
+            BOOL controllerReported = [self reportControllerArrival:limeController];
+            if (controllerReported) {
+                [self autoEnableDesktopPointerForControllerIfNeeded:limeController];
+            }
             
             // Re-evaluate the on-screen control mode
             [self updateAutoOnScreenControlMode];
@@ -1139,17 +1931,38 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
         
         GCController* controller = note.object;
         
-        if (![ControllerSupport isSupportedGamepad:controller]) {
-            // Ignore micro gamepads and motion controllers
+        NSNumber *controllerKey = nil;
+        Controller *limeController = nil;
+        for (NSNumber *candidateKey in self->_controllers) {
+            Controller *candidate = self->_controllers[candidateKey];
+            if (candidate.gamepad == controller) {
+                controllerKey = candidateKey;
+                limeController = candidate;
+                break;
+            }
+        }
+
+        [self unregisterControllerCallbacks:controller];
+        if (limeController == nil) {
+            Log(LOG_W, @"Disconnected controller was not assigned");
             return;
         }
-        
-        [self unregisterControllerCallbacks:controller];
-        self->_controllerNumbers &= ~(1 << controller.playerIndex);
-        Log(LOG_I, @"Unassigning controller index: %ld", (long)controller.playerIndex);
-        
-        Controller* limeController = [self->_controllers objectForKey:[NSNumber numberWithInteger:controller.playerIndex]];
+
+        NSInteger savedPlayerIndex = limeController.playerIndex;
+        if (savedPlayerIndex >= 0 && savedPlayerIndex < 8) {
+            self->_controllerNumbers &= (char)~(1u << savedPlayerIndex);
+        }
+        else {
+            Log(LOG_W, @"Ignoring invalid saved controller index: %ld", (long)savedPlayerIndex);
+        }
+        Log(LOG_I, @"Unassigning controller index: %ld", (long)savedPlayerIndex);
+
         if (limeController) {
+            [self releaseControllerTouchpadTouches:limeController];
+            // Release any emulated mouse buttons and stop the pointer timer
+            // before this controller disappears.
+            [self resetControllerPointerMode:limeController notifyDelegate:NO];
+
             // Stop haptics on this controller
             [self cleanupControllerHaptics:limeController];
             
@@ -1167,7 +1980,13 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
             
             // Inform the server of the updated active gamepads before removing this controller
             [self updateFinished:limeController];
-            [self->_controllers removeObjectForKey:[NSNumber numberWithInteger:controller.playerIndex]];
+            [self->_controllers removeObjectForKey:controllerKey];
+
+            NSArray<NSNumber *> *remainingControllerNumbers =
+                [[self->_controllers allKeys] sortedArrayUsingSelector:@selector(compare:)];
+            for (NSNumber *controllerNumber in remainingControllerNumbers) {
+                [self autoEnableDesktopPointerForControllerIfNeeded:self->_controllers[controllerNumber]];
+            }
             
             // Re-evaluate the on-screen control mode
             [self updateAutoOnScreenControlMode];
@@ -1219,26 +2038,104 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
             [self updateAutoOnScreenControlMode];
         }];
     }
+
+    _applicationWillResignActiveObserver = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+        // Never leave a host mouse button held or a run-loop timer active while
+        // the client is backgrounded or interrupted by system UI.
+        atomic_store(&self->_inputSuspended, true);
+        MoonlightSetMouseInputSuspended(YES);
+        @synchronized(self->_oscController) {
+            self->_oscController.lastButtonFlags = 0;
+            self->_oscController.lastLeftTrigger = 0;
+            self->_oscController.lastRightTrigger = 0;
+            self->_oscController.lastLeftStickX = 0;
+            self->_oscController.lastLeftStickY = 0;
+            self->_oscController.lastRightStickX = 0;
+            self->_oscController.lastRightStickY = 0;
+        }
+        if (self->_oscEnabled && self->_oscController.reportedArrival) {
+            [self sendNeutralControllerEvent:self->_oscController];
+        }
+        for (Controller* controller in [self->_controllers allValues]) {
+            @synchronized(controller) {
+                controller.pointerModeWasEnabledBeforeResign = controller.pointerModeEnabled;
+            }
+            [self releaseControllerTouchpadTouches:controller];
+            [self resetControllerPointerMode:controller notifyDelegate:NO];
+            [self sendNeutralControllerEvent:controller];
+        }
+    }];
+    _applicationDidBecomeActiveObserver = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+        atomic_store(&self->_inputSuspended, false);
+        MoonlightSetMouseInputSuspended(NO);
+        for (Controller* controller in [self->_controllers allValues]) {
+            BOOL restorePointerMode;
+            @synchronized(controller) {
+                restorePointerMode = controller.pointerModeWasEnabledBeforeResign;
+                controller.pointerModeWasEnabledBeforeResign = NO;
+                GCExtendedGamepad *gamepad = controller.gamepad.extendedGamepad;
+                if (gamepad != nil) {
+                    // Re-sample live axes in case release callbacks were coalesced
+                    // while inactive; never restart pointer motion from stale values.
+                    controller.lastLeftStickX = gamepad.leftThumbstick.xAxis.value * 0x7FFE;
+                    controller.lastLeftStickY = gamepad.leftThumbstick.yAxis.value * 0x7FFE;
+                    controller.lastRightStickX = gamepad.rightThumbstick.xAxis.value * 0x7FFE;
+                    controller.lastRightStickY = gamepad.rightThumbstick.yAxis.value * 0x7FFE;
+                    controller.lastLeftTrigger = gamepad.leftTrigger.value * 0xFF;
+                    controller.lastRightTrigger = gamepad.rightTrigger.value * 0xFF;
+                }
+            }
+            if (restorePointerMode) {
+                [self setControllerPointerMode:controller enabled:YES notifyDelegate:YES];
+            }
+        }
+
+        NSArray<NSNumber *> *controllerNumbers =
+            [[self->_controllers allKeys] sortedArrayUsingSelector:@selector(compare:)];
+        for (NSNumber *controllerNumber in controllerNumbers) {
+            [self autoEnableDesktopPointerForControllerIfNeeded:self->_controllers[controllerNumber]];
+        }
+    }];
     
     return self;
 }
 
 -(void) connectionEstablished
 {
-    for (Controller* controller in [_controllers allValues]) {
+    if (atomic_load_explicit(&_inputSuspended, memory_order_acquire)) {
+        return;
+    }
+    _connectionEstablished = true;
+    NSArray<NSNumber *> *controllerNumbers =
+        [[_controllers allKeys] sortedArrayUsingSelector:@selector(compare:)];
+    for (NSNumber *controllerNumber in controllerNumbers) {
+        Controller *controller = _controllers[controllerNumber];
         // Report the controller arrival to the host if we haven't done so yet
         [self reportControllerArrival:controller];
+        [self autoEnableDesktopPointerForControllerIfNeeded:controller];
     }
 }
 
 -(void) cleanup
 {
+    @synchronized(self) {
+        if (_cleanupComplete) {
+            return;
+        }
+        _cleanupComplete = true;
+        atomic_store_explicit(&_inputSuspended, true, memory_order_release);
+    }
+    MoonlightSetMouseInputSuspended(YES);
+    _delegate = nil;
+
     [[NSNotificationCenter defaultCenter] removeObserver:_controllerConnectObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:_controllerDisconnectObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:_mouseConnectObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:_mouseDisconnectObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:_keyboardConnectObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:_keyboardDisconnectObserver];
+    [[NSNotificationCenter defaultCenter] removeObserver:_applicationWillResignActiveObserver];
+    [[NSNotificationCenter defaultCenter] removeObserver:_applicationDidBecomeActiveObserver];
     
     _controllerConnectObserver = nil;
     _controllerDisconnectObserver = nil;
@@ -1246,15 +2143,33 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     _mouseDisconnectObserver = nil;
     _keyboardConnectObserver = nil;
     _keyboardDisconnectObserver = nil;
+    _applicationWillResignActiveObserver = nil;
+    _applicationDidBecomeActiveObserver = nil;
     
     _controllerNumbers = 0;
     
-    for (Controller* controller in [_controllers allValues]) {
+    NSArray<Controller*>* controllersToClean;
+    @synchronized(self) {
+        controllersToClean = [_controllers.allValues copy];
+    }
+    for (Controller* controller in controllersToClean) {
+        [self releaseControllerTouchpadTouches:controller];
+        [self resetControllerPointerMode:controller notifyDelegate:NO];
         [self cleanupControllerHaptics:controller];
         [self cleanupControllerMotion:controller];
         [self cleanupControllerBattery:controller];
     }
-    [_controllers removeAllObjects];
+    @synchronized(self) {
+        for (int mouseButton = BUTTON_LEFT; mouseButton <= BUTTON_X2; mouseButton++) {
+            if (_pointerMouseButtonRefCounts[mouseButton] > 0) {
+                MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceControllerPointer, BUTTON_ACTION_RELEASE, mouseButton);
+                _pointerMouseButtonRefCounts[mouseButton] = 0;
+            }
+        }
+    }
+    @synchronized(self) {
+        [_controllers removeAllObjects];
+    }
     
     for (GCController* controller in [GCController controllers]) {
         if ([ControllerSupport isSupportedGamepad:controller]) {
@@ -1267,6 +2182,10 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
             [self unregisterMouseCallbacks:mouse];
         }
     }
+}
+
+- (void)dealloc {
+    [self cleanup];
 }
 
 @end
