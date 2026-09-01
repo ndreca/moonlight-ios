@@ -8,6 +8,21 @@
 
 #import "AppDelegate.h"
 
+@interface MoonlightSceneDelegate : UIResponder <UIWindowSceneDelegate>
+
+@property (strong, nonatomic) UIWindow *window;
+
+@end
+
+@interface AppDelegate ()
+
+#if !TARGET_OS_TV
+- (void)handleShortcutItem:(UIApplicationShortcutItem *)shortcutItem
+          completionHandler:(void (^)(BOOL succeeded))completionHandler;
+#endif
+
+@end
+
 @implementation AppDelegate
 
 @synthesize managedObjectContext = _managedObjectContext;
@@ -15,6 +30,10 @@
 @synthesize persistentStoreCoordinator = _persistentStoreCoordinator;
 
 static NSOperationQueue* mainQueue;
+
+#if !TARGET_OS_TV
+NSNotificationName const MoonlightShortcutItemReceivedNotification = @"MoonlightShortcutItemReceivedNotification";
+#endif
 
 #if TARGET_OS_TV
 static NSString* DB_NAME = @"Moonlight_tvOS.bin";
@@ -26,7 +45,7 @@ static NSString* DB_NAME = @"Limelight_iOS.sqlite";
 #if !TARGET_OS_TV
     UIApplicationShortcutItem* shortcut = [launchOptions valueForKey:UIApplicationLaunchOptionsShortcutItemKey];
     if (shortcut != nil) {
-        _pcUuidToLoad = (NSString*)[shortcut.userInfo objectForKey:@"UUID"];
+        [self handleShortcutItem:shortcut completionHandler:nil];
     }
 #endif
     return YES;
@@ -34,10 +53,70 @@ static NSString* DB_NAME = @"Limelight_iOS.sqlite";
 
 #if !TARGET_OS_TV
 - (void)application:(UIApplication *)application performActionForShortcutItem:(UIApplicationShortcutItem *)shortcutItem completionHandler:(void (^)(BOOL succeeded))completionHandler {
+    [self handleShortcutItem:shortcutItem completionHandler:completionHandler];
+}
+
+- (void)handleShortcutItem:(UIApplicationShortcutItem *)shortcutItem completionHandler:(void (^)(BOOL succeeded))completionHandler {
     _pcUuidToLoad = (NSString*)[shortcutItem.userInfo objectForKey:@"UUID"];
     _shortcutCompletionHandler = completionHandler;
+
+    [[NSNotificationCenter defaultCenter] postNotificationName:MoonlightShortcutItemReceivedNotification object:nil];
 }
 #endif
+
+- (UISceneConfiguration *)application:(UIApplication *)application
+configurationForConnectingSceneSession:(UISceneSession *)connectingSceneSession
+                               options:(UISceneConnectionOptions *)options {
+    UISceneConfiguration *configuration = [[UISceneConfiguration alloc] initWithName:@"Default Configuration"
+                                                                          sessionRole:connectingSceneSession.role];
+
+    if (![connectingSceneSession.role isEqualToString:UIWindowSceneSessionRoleApplication]) {
+        return configuration;
+    }
+
+    configuration.delegateClass = [MoonlightSceneDelegate class];
+
+#if TARGET_OS_TV
+    NSString *storyboardName = @"Main";
+#else
+    NSString *storyboardName = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad ? @"iPad" : @"iPhone";
+#endif
+    configuration.storyboard = [UIStoryboard storyboardWithName:storyboardName bundle:nil];
+    return configuration;
+}
+
+- (UIWindow *)activeWindow {
+    if (self.window.isKeyWindow) {
+        return self.window;
+    }
+
+    UIWindow *fallbackWindow = self.window;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
+            continue;
+        }
+
+        if (![scene.session.role isEqualToString:UIWindowSceneSessionRoleApplication]) {
+            continue;
+        }
+
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        if (windowScene.activationState == UISceneActivationStateForegroundActive ||
+            windowScene.activationState == UISceneActivationStateForegroundInactive) {
+            for (UIWindow *window in windowScene.windows) {
+                if (window.isKeyWindow) {
+                    return window;
+                }
+            }
+        }
+
+        if (fallbackWindow == nil && windowScene.activationState != UISceneActivationStateUnattached) {
+            fallbackWindow = windowScene.windows.firstObject;
+        }
+    }
+
+    return fallbackWindow;
+}
 
 - (void)applicationWillResignActive:(UIApplication *)application
 {
@@ -209,6 +288,44 @@ static NSString* DB_NAME = @"Limelight_iOS.sqlite";
 #else
     return [[self applicationDocumentsDirectory] URLByAppendingPathComponent:DB_NAME];
 #endif
+}
+
+@end
+
+@implementation MoonlightSceneDelegate
+
+- (void)scene:(UIScene *)scene
+willConnectToSession:(UISceneSession *)session
+      options:(UISceneConnectionOptions *)connectionOptions {
+    if (![scene isKindOfClass:[UIWindowScene class]]) {
+        return;
+    }
+
+    AppDelegate *appDelegate = (AppDelegate *)UIApplication.sharedApplication.delegate;
+    appDelegate.window = self.window;
+    [self.window makeKeyAndVisible];
+
+#if !TARGET_OS_TV
+    if (connectionOptions.shortcutItem != nil) {
+        [appDelegate handleShortcutItem:connectionOptions.shortcutItem completionHandler:nil];
+    }
+#endif
+}
+
+#if !TARGET_OS_TV
+- (void)windowScene:(UIWindowScene *)windowScene
+performActionForShortcutItem:(UIApplicationShortcutItem *)shortcutItem
+  completionHandler:(void (^)(BOOL succeeded))completionHandler {
+    AppDelegate *appDelegate = (AppDelegate *)UIApplication.sharedApplication.delegate;
+    [appDelegate handleShortcutItem:shortcutItem completionHandler:completionHandler];
+}
+#endif
+
+- (void)sceneDidDisconnect:(UIScene *)scene {
+    AppDelegate *appDelegate = (AppDelegate *)UIApplication.sharedApplication.delegate;
+    if (appDelegate.window == self.window) {
+        appDelegate.window = nil;
+    }
 }
 
 @end
