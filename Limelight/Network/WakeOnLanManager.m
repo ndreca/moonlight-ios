@@ -16,12 +16,15 @@
 
 @implementation WakeOnLanManager
 
-static const int numStaticPorts = 2;
+enum {
+    numStaticPorts = 2,
+    numDynamicPorts = 5,
+};
+
 static const int staticPorts[numStaticPorts] = {
     9, // Standard WOL port (privileged port)
     47009, // Port opened by Moonlight Internet Hosting Tool for WoL (non-privileged port)
 };
-static const int numDynamicPorts = 5;
 static const int dynamicPorts[numDynamicPorts] = {
     47998, 47999, 48000, 48002, 48010, // Ports opened by GFE/Sunshine
 };

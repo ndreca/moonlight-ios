@@ -15,8 +15,6 @@
 #include <openssl/evp.h>
 
 @implementation CryptoManager
-static const int SHA1_HASH_LENGTH = 20;
-static const int SHA256_HASH_LENGTH = 32;
 static NSData* key = nil;
 static NSData* cert = nil;
 static NSData* p12 = nil;
@@ -30,14 +28,14 @@ static NSData* p12 = nil;
 }
 
 - (NSData*) SHA1HashData:(NSData*)data {
-    unsigned char sha1[SHA1_HASH_LENGTH];
+    unsigned char sha1[SHA_DIGEST_LENGTH];
     SHA1([data bytes], [data length], sha1);
     NSData* bytes = [NSData dataWithBytes:sha1 length:sizeof(sha1)];
     return bytes;
 }
 
 - (NSData*) SHA256HashData:(NSData*)data {
-    unsigned char sha256[SHA256_HASH_LENGTH];
+    unsigned char sha256[SHA256_DIGEST_LENGTH];
     SHA256([data bytes], [data length], sha256);
     NSData* bytes = [NSData dataWithBytes:sha256 length:sizeof(sha256)];
     return bytes;
@@ -192,24 +190,30 @@ static NSData* p12 = nil;
 }
 
 + (NSData*) readCertFromFile {
-    if (cert == nil) {
-        cert = [CryptoManager readCryptoObject:@"client.crt"];
+    @synchronized(self) {
+        if (cert == nil) {
+            cert = [CryptoManager readCryptoObject:@"client.crt"];
+        }
+        return cert;
     }
-    return cert;
 }
 
 + (NSData*) readP12FromFile {
-    if (p12 == nil) {
-        p12 = [CryptoManager readCryptoObject:@"client.p12"];
+    @synchronized(self) {
+        if (p12 == nil) {
+            p12 = [CryptoManager readCryptoObject:@"client.p12"];
+        }
+        return p12;
     }
-    return p12;
 }
 
 + (NSData*) readKeyFromFile {
-    if (key == nil) {
-        key = [CryptoManager readCryptoObject:@"client.key"];
+    @synchronized(self) {
+        if (key == nil) {
+            key = [CryptoManager readCryptoObject:@"client.key"];
+        }
+        return key;
     }
-    return key;
 }
 
 + (bool) keyPairExists {
@@ -248,9 +252,15 @@ static NSData* p12 = nil;
 }
 
 + (NSData*)getKeyFromCertKeyPair:(CertKeyPair*)certKeyPair {
+    if (certKeyPair == NULL || certKeyPair->pkey == NULL) {
+        return nil;
+    }
     BIO* bio = BIO_new(BIO_s_mem());
-    
-    PEM_write_bio_PrivateKey_traditional(bio, certKeyPair->pkey, NULL, NULL, 0, NULL, NULL);
+    if (bio == NULL ||
+        !PEM_write_bio_PrivateKey_traditional(bio, certKeyPair->pkey, NULL, NULL, 0, NULL, NULL)) {
+        BIO_free(bio);
+        return nil;
+    }
     
     BUF_MEM* mem;
     BIO_get_mem_ptr(bio, &mem);
@@ -260,9 +270,14 @@ static NSData* p12 = nil;
 }
 
 + (NSData*)getP12FromCertKeyPair:(CertKeyPair*)certKeyPair {
+    if (certKeyPair == NULL || certKeyPair->p12 == NULL) {
+        return nil;
+    }
     BIO* bio = BIO_new(BIO_s_mem());
-    
-    i2d_PKCS12_bio(bio, certKeyPair->p12);
+    if (bio == NULL || !i2d_PKCS12_bio(bio, certKeyPair->p12)) {
+        BIO_free(bio);
+        return nil;
+    }
     
     BUF_MEM* mem;
     BIO_get_mem_ptr(bio, &mem);
@@ -272,9 +287,14 @@ static NSData* p12 = nil;
 }
 
 + (NSData*)getCertFromCertKeyPair:(CertKeyPair*)certKeyPair {
+    if (certKeyPair == NULL || certKeyPair->x509 == NULL) {
+        return nil;
+    }
     BIO* bio = BIO_new(BIO_s_mem());
-    
-    PEM_write_bio_X509(bio, certKeyPair->x509);
+    if (bio == NULL || !PEM_write_bio_X509(bio, certKeyPair->x509)) {
+        BIO_free(bio);
+        return nil;
+    }
     
     BUF_MEM* mem;
     BIO_get_mem_ptr(bio, &mem);
@@ -284,8 +304,7 @@ static NSData* p12 = nil;
 }
 
 + (void) generateKeyPairUsingSSL {
-    static dispatch_once_t pred;
-    dispatch_once(&pred, ^{
+    @synchronized(self) {
         if (![CryptoManager keyPairExists]) {
             Log(LOG_I, @"Generating Certificate... ");
             CertKeyPair certKeyPair = generateCertKeyPair();
@@ -295,14 +314,26 @@ static NSData* p12 = nil;
             NSData* keyData = [CryptoManager getKeyFromCertKeyPair:&certKeyPair];
             
             freeCertKeyPair(certKeyPair);
+
+            if (certData.length == 0 || p12Data.length == 0 || keyData.length == 0) {
+                Log(LOG_E, @"Certificate generation failed");
+                return;
+            }
             
             [CryptoManager writeCryptoObject:@"client.crt" data:certData];
             [CryptoManager writeCryptoObject:@"client.p12" data:p12Data];
             [CryptoManager writeCryptoObject:@"client.key" data:keyData];
+
+            // Publish the complete set only after all serialization and writes
+            // succeeded. Reads on authentication delegate queues use this same
+            // lock, so they can never observe a partially generated identity.
+            cert = certData;
+            p12 = p12Data;
+            key = keyData;
             
             Log(LOG_I, @"Certificate created");
         }
-    });
+    }
 }
 
 @end

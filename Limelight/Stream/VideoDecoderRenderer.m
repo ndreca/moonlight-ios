@@ -8,6 +8,7 @@
 
 #import "VideoDecoderRenderer.h"
 #import "StreamView.h"
+#import <objc/runtime.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavcodec/cbs.h>
@@ -19,9 +20,20 @@
 extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
                               int write_seq_header);
 
+@class VideoDecoderRenderer;
+
+@interface RendererWeakReference : NSObject
+@property(nonatomic, weak) VideoDecoderRenderer* renderer;
+@end
+
+@implementation RendererWeakReference
+@end
+
+static const void* RendererReferenceKey = &RendererReferenceKey;
+
 @implementation VideoDecoderRenderer {
-    StreamView* _view;
-    id<ConnectionCallbacks> _callbacks;
+    __weak StreamView* _view;
+    __weak id<ConnectionCallbacks> _callbacks;
     float _streamAspectRatio;
     
     AVSampleBufferDisplayLayer* displayLayer;
@@ -34,7 +46,51 @@ extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
     CMVideoFormatDescriptionRef formatDesc;
     
     CADisplayLink* _displayLink;
+    BOOL _stopped;
     BOOL framePacing;
+}
+
+- (void)updateLayout
+{
+    if (displayLayer == nil || _view == nil) {
+        return;
+    }
+
+    CGRect viewBounds = _view.bounds;
+    CGSize videoSize = CGSizeZero;
+    if (viewBounds.size.width > 0 && viewBounds.size.height > 0 && _streamAspectRatio > 0) {
+        if (viewBounds.size.width > viewBounds.size.height * _streamAspectRatio) {
+            videoSize = CGSizeMake(viewBounds.size.height * _streamAspectRatio, viewBounds.size.height);
+        }
+        else {
+            videoSize = CGSizeMake(viewBounds.size.width, viewBounds.size.width / _streamAspectRatio);
+        }
+    }
+
+    // Display-layer geometry must track rotation and multitasking resizes without
+    // Core Animation interpolating through an invalid intermediate video rect.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    displayLayer.position = CGPointMake(CGRectGetMidX(viewBounds), CGRectGetMidY(viewBounds));
+    displayLayer.bounds = CGRectMake(0, 0, videoSize.width, videoSize.height);
+    [CATransaction commit];
+}
+
++ (void)updateLayoutForView:(UIView*)view
+{
+    if (view == nil) {
+        return;
+    }
+
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateLayoutForView:view];
+        });
+        return;
+    }
+
+    RendererWeakReference* reference = objc_getAssociatedObject(view, RendererReferenceKey);
+    [reference.renderer updateLayout];
 }
 
 - (void)reinitializeDisplayLayer
@@ -49,14 +105,6 @@ extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
     // respects the PAR encoded in the SPS which causes our computed video-relative
     // touch location to be wrong in StreamView if the aspect ratio of the host
     // desktop doesn't match the aspect ratio of the stream.
-    CGSize videoSize;
-    if (_view.bounds.size.width > _view.bounds.size.height * _streamAspectRatio) {
-        videoSize = CGSizeMake(_view.bounds.size.height * _streamAspectRatio, _view.bounds.size.height);
-    } else {
-        videoSize = CGSizeMake(_view.bounds.size.width, _view.bounds.size.width / _streamAspectRatio);
-    }
-    displayLayer.position = CGPointMake(CGRectGetMidX(_view.bounds), CGRectGetMidY(_view.bounds));
-    displayLayer.bounds = CGRectMake(0, 0, videoSize.width, videoSize.height);
     displayLayer.videoGravity = AVLayerVideoGravityResize;
 
     // Hide the layer until we get an IDR frame. This ensures we
@@ -70,6 +118,8 @@ extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
     else {
         [_view.layer addSublayer:displayLayer];
     }
+
+    [self updateLayout];
     
     if (formatDesc != nil) {
         CFRelease(formatDesc);
@@ -85,6 +135,13 @@ extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
     _callbacks = callbacks;
     _streamAspectRatio = aspectRatio;
     framePacing = useFramePacing;
+    // HDR_INFO may arrive after control starts but before DrStart. Accept that
+    // initial metadata; stop flips this flag to reject only terminal callbacks.
+    _stopped = NO;
+
+    RendererWeakReference* reference = [[RendererWeakReference alloc] init];
+    reference.renderer = self;
+    objc_setAssociatedObject(view, RendererReferenceKey, reference, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     
     parameterSetBuffers = [[NSMutableArray alloc] init];
     
@@ -101,14 +158,28 @@ extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
 
 - (void)start
 {
-    _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayLinkCallback:)];
-    if (@available(iOS 15.0, tvOS 15.0, *)) {
-        _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(self->frameRate, self->frameRate, self->frameRate);
+    void (^startDisplayLink)(void) = ^{
+        self->_stopped = NO;
+        [self->_displayLink invalidate];
+        self->_displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayLinkCallback:)];
+        if (@available(iOS 15.0, tvOS 15.0, *)) {
+            self->_displayLink.preferredFrameRateRange = CAFrameRateRangeMake(self->frameRate, self->frameRate, self->frameRate);
+        }
+        else {
+            self->_displayLink.preferredFramesPerSecond = self->frameRate;
+        }
+        [self->_displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    };
+
+    // DrStart runs on common's connection thread. NSRunLoop may only be
+    // modified by its owning thread, so use main synchronously to guarantee the
+    // display link is installed before pull rendering begins.
+    if (NSThread.isMainThread) {
+        startDisplayLink();
     }
     else {
-        _displayLink.preferredFramesPerSecond = self->frameRate;
+        dispatch_sync(dispatch_get_main_queue(), startDisplayLink);
     }
-    [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSDefaultRunLoopMode];
 }
 
 // TODO: Refactor this
@@ -142,7 +213,20 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
 
 - (void)stop
 {
-    [_displayLink invalidate];
+    void (^stopDisplayLink)(void) = ^{
+        self->_stopped = YES;
+        [self->_displayLink invalidate];
+        self->_displayLink = nil;
+    };
+
+    // This main-queue barrier also drains an in-flight displayLinkCallback
+    // before common destroys its pull-render queue.
+    if (NSThread.isMainThread) {
+        stopDisplayLink();
+    }
+    else {
+        dispatch_sync(dispatch_get_main_queue(), stopDisplayLink);
+    }
 }
 
 #define NALU_START_PREFIX_SIZE 3
@@ -376,10 +460,15 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
     
     // Referenced the VP9 code in Chrome that performs a similar function
     // https://source.chromium.org/chromium/chromium/src/+/main:media/gpu/mac/vt_config_util.mm;drc=977dc02c431b4979e34c7792bc3d646f649dacb4;l=155
+    NSData *av1CodecConfiguration = [self getAv1CodecConfigurationBox:frameData];
+    if (av1CodecConfiguration == nil) {
+        Log(LOG_E, @"Failed to create AV1 codec configuration box");
+        ff_cbs_fragment_free(&cbsFrag);
+        ff_cbs_close(&cbsCtx);
+        return NULL;
+    }
     extensions[(__bridge NSString*)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms] =
-    @{
-        @"av1C" : [self getAv1CodecConfigurationBox:frameData],
-    };
+        @{ @"av1C" : av1CodecConfiguration };
     extensions[@"BitsPerComponent"] = @(bitstreamCtx->bit_depth);
     
 #undef SET_EXTENSION
@@ -614,6 +703,17 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
 }
 
 - (void)setHdrMode:(BOOL)enabled {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self setHdrMode:enabled];
+        });
+        return;
+    }
+
+    if (_stopped) {
+        return;
+    }
+
     SS_HDR_METADATA hdrMetadata;
     
     BOOL hasMetadata = enabled && LiGetHdrMetadata(&hdrMetadata);

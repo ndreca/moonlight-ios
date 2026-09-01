@@ -18,13 +18,15 @@
 #import "IdManager.h"
 
 #include <Limelight.h>
+#include <stdatomic.h>
 
 @implementation StreamManager {
     StreamConfiguration* _config;
 
-    UIView* _renderView;
-    id<ConnectionCallbacks> _callbacks;
+    __weak UIView* _renderView;
+    __weak id<ConnectionCallbacks> _callbacks;
     Connection* _connection;
+    _Atomic(bool) _stopped;
 }
 
 - (id) initWithConfig:(StreamConfiguration*)config renderView:(UIView*)view connectionCallbacks:(id<ConnectionCallbacks>)callbacks {
@@ -34,11 +36,22 @@
     _callbacks = callbacks;
     _config.riKey = [Utils randomBytes:16];
     _config.riKeyId = arc4random();
+    atomic_store(&_stopped, false);
     return self;
 }
 
+- (BOOL)isStopping {
+    return self.cancelled || atomic_load(&_stopped);
+}
+
 - (void)main {
+    if ([self isStopping]) {
+        return;
+    }
     [CryptoManager generateKeyPairUsingSSL];
+    if ([self isStopping]) {
+        return;
+    }
     
     HttpManager* hMan = [[HttpManager alloc] initWithAddress:_config.host httpsPort:_config.httpsPort
                                                      serverCert:_config.serverCert];
@@ -46,6 +59,9 @@
     ServerInfoResponse* serverInfoResp = [[ServerInfoResponse alloc] init];
     [hMan executeRequestSynchronously:[HttpRequest requestForResponse:serverInfoResp withUrlRequest:[hMan newServerInfoRequest:false]
                                        fallbackError:401 fallbackRequest:[hMan newHttpServerInfoRequest]]];
+    if ([self isStopping]) {
+        return;
+    }
     NSString* pairStatus = [serverInfoResp getStringTag:@"PairStatus"];
     NSString* appversion = [serverInfoResp getStringTag:@"appversion"];
     NSString* gfeVersion = [serverInfoResp getStringTag:@"GfeVersion"];
@@ -96,24 +112,47 @@
     
     // Populate RTSP session URL from launch/resume response
     _config.rtspSessionUrl = sessionUrl;
+    if ([self isStopping]) {
+        return;
+    }
     
     // Initializing the renderer must be done on the main thread
     dispatch_async(dispatch_get_main_queue(), ^{
+        if ([self isStopping]) {
+            return;
+        }
         VideoDecoderRenderer* renderer = [[VideoDecoderRenderer alloc] initWithView:self->_renderView callbacks:self->_callbacks streamAspectRatio:(float)self->_config.width / (float)self->_config.height useFramePacing:self->_config.useFramePacing];
-        self->_connection = [[Connection alloc] initWithConfig:self->_config renderer:renderer connectionCallbacks:self->_callbacks];
+        Connection *connection = [[Connection alloc] initWithConfig:self->_config renderer:renderer connectionCallbacks:self->_callbacks];
+        if (connection == nil) {
+            [self->_callbacks launchFailed:@"Invalid stream configuration received from the host"];
+            return;
+        }
+        @synchronized(self) {
+            if ([self isStopping]) {
+                return;
+            }
+            self->_connection = connection;
+        }
         NSOperationQueue* opQueue = [[NSOperationQueue alloc] init];
-        [opQueue addOperation:self->_connection];
+        [opQueue addOperation:connection];
     });
 }
 
 - (void) stopStream
 {
-    [_connection terminate];
+    atomic_store(&_stopped, true);
+    [self cancel];
+    @synchronized(self) {
+        [_connection terminate];
+    }
 }
 
 - (BOOL) launchApp:(HttpManager*)hMan receiveSessionUrl:(NSString**)sessionUrl {
     HttpResponse* launchResp = [[HttpResponse alloc] init];
     [hMan executeRequestSynchronously:[HttpRequest requestForResponse:launchResp withUrlRequest:[hMan newLaunchOrResumeRequest:@"launch" config:_config]]];
+    if ([self isStopping]) {
+        return FALSE;
+    }
     NSString *gameSession = [launchResp getStringTag:@"gamesession"];
     if (![launchResp isStatusOk]) {
         [_callbacks launchFailed:launchResp.statusMessage];
@@ -132,6 +171,9 @@
 - (BOOL) resumeApp:(HttpManager*)hMan receiveSessionUrl:(NSString**)sessionUrl {
     HttpResponse* resumeResp = [[HttpResponse alloc] init];
     [hMan executeRequestSynchronously:[HttpRequest requestForResponse:resumeResp withUrlRequest:[hMan newLaunchOrResumeRequest:@"resume" config:_config]]];
+    if ([self isStopping]) {
+        return FALSE;
+    }
     NSString* resume = [resumeResp getStringTag:@"resume"];
     if (![resumeResp isStatusOk]) {
         [_callbacks launchFailed:resumeResp.statusMessage];
