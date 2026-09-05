@@ -34,6 +34,7 @@
 @interface StreamFrameViewController ()
 - (void)prepareForTerminalStreamStop;
 - (void)stopStreamSafely;
+- (void)completeBackgroundStreamShutdown;
 @end
 
 @implementation StreamFrameViewController {
@@ -54,10 +55,12 @@
     UIScrollView *_scrollView;
     BOOL _userIsInteracting;
     _Atomic(bool) _terminalInputPrepared;
+    _Atomic(bool) _backgroundShutdownStarted;
     CGSize _keyboardSize;
     
 #if !TARGET_OS_TV
     UIScreenEdgePanGestureRecognizer *_exitSwipeRecognizer;
+    UIBackgroundTaskIdentifier _backgroundShutdownTask;
 #endif
 }
 
@@ -97,6 +100,10 @@
     [super viewDidLoad];
 
     atomic_init(&_terminalInputPrepared, false);
+    atomic_init(&_backgroundShutdownStarted, false);
+#if !TARGET_OS_TV
+    _backgroundShutdownTask = UIBackgroundTaskInvalid;
+#endif
 
     [self.navigationController setNavigationBarHidden:YES animated:NO];
     self.edgesForExtendedLayout = UIRectEdgeAll;
@@ -227,6 +234,16 @@
                                              selector: @selector(applicationDidEnterBackground:)
                                                  name: UIApplicationDidEnterBackgroundNotification
                                                object: nil];
+
+    if (@available(iOS 13.0, tvOS 13.0, *)) {
+        // Scene-based apps may transition the active window scene before the
+        // legacy application notification reaches this controller. Observe
+        // both; the shutdown path is atomic and idempotent.
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(applicationDidEnterBackground:)
+                                                     name:UISceneDidEnterBackgroundNotification
+                                                   object:nil];
+    }
 
 #if 0
     // FIXME: This doesn't work reliably on iPad for some reason. Showing and hiding the keyboard
@@ -432,6 +449,27 @@
     [_streamMan stopStream];
 }
 
+- (void)completeBackgroundStreamShutdown {
+#if !TARGET_OS_TV
+    void (^complete)(void) = ^{
+        if (self->_backgroundShutdownTask == UIBackgroundTaskInvalid) {
+            return;
+        }
+
+        UIBackgroundTaskIdentifier task = self->_backgroundShutdownTask;
+        self->_backgroundShutdownTask = UIBackgroundTaskInvalid;
+        [[UIApplication sharedApplication] endBackgroundTask:task];
+    };
+
+    if (NSThread.isMainThread) {
+        complete();
+    }
+    else {
+        dispatch_async(dispatch_get_main_queue(), complete);
+    }
+#endif
+}
+
 #if 0
 - (void)keyboardWillShow:(NSNotification *)notification {
     _keyboardSize = [[[notification userInfo] objectForKey:UIKeyboardFrameBeginUserInfoKey] CGRectValue].size;
@@ -556,16 +594,43 @@
     }
 }
 
-// This fires when the home button is pressed
-- (void)applicationDidEnterBackground:(UIApplication *)application {
+// This fires when the app or its active scene enters the background.
+- (void)applicationDidEnterBackground:(NSNotification *)notification {
+    if (atomic_exchange_explicit(&_backgroundShutdownStarted, true, memory_order_acq_rel)) {
+        return;
+    }
+
     Log(LOG_I, @"Terminating stream immediately for backgrounding");
 
     if (_inactivityTimer != nil) {
         [_inactivityTimer invalidate];
         _inactivityTimer = nil;
     }
-    
+
+#if !TARGET_OS_TV
+    UIApplication *application = UIApplication.sharedApplication;
+    __weak StreamFrameViewController *weakSelf = self;
+    _backgroundShutdownTask = [application beginBackgroundTaskWithName:@"Moonlight Stream Teardown"
+                                                     expirationHandler:^{
+        StreamFrameViewController *strongSelf = weakSelf;
+        Log(LOG_W, @"Background stream teardown time expired");
+        [strongSelf completeBackgroundStreamShutdown];
+    }];
+
+    // Keep the host application running, but fully close the streaming
+    // connection before iOS suspends this process. Otherwise a half-finished
+    // teardown can collide with the next Sunshine portal capture session.
+    [self updatePreferredDisplayMode:NO];
+    [self prepareForTerminalStreamStop];
+    [_streamMan stopStreamWithCompletion:^{
+        Log(LOG_I, @"Background stream teardown completed");
+        [self completeBackgroundStreamShutdown];
+    }];
+    [UIApplication sharedApplication].idleTimerDisabled = NO;
+    [self.navigationController popToRootViewControllerAnimated:NO];
+#else
     [self returnToMainFrame];
+#endif
 }
 
 - (void)edgeSwiped {

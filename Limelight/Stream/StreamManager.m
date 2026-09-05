@@ -140,10 +140,23 @@
 
 - (void) stopStream
 {
+    [self stopStreamWithCompletion:nil];
+}
+
+- (void) stopStreamWithCompletion:(dispatch_block_t)completion
+{
     atomic_store(&_stopped, true);
     [self cancel];
+    Connection *connection;
     @synchronized(self) {
-        [_connection terminate];
+        connection = _connection;
+    }
+
+    if (connection != nil) {
+        [connection terminateWithCompletion:completion];
+    }
+    else if (completion != nil) {
+        dispatch_async(dispatch_get_main_queue(), completion);
     }
 }
 

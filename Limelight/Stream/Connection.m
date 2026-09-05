@@ -32,6 +32,8 @@
     __weak id<ConnectionCallbacks> _instanceCallbacks;
     uint64_t _generation;
     _Atomic(bool) _terminated;
+    NSMutableArray<dispatch_block_t>* _terminationCompletions;
+    BOOL _terminationFinished;
 }
 
 static NSLock* lifecycleLock;
@@ -359,12 +361,48 @@ void ClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t
     [_callbacks setControllerLed:controllerNumber r:r g:g b:b];
 }
 
+-(void) finishTermination
+{
+    NSArray<dispatch_block_t>* completions;
+    @synchronized(self) {
+        _terminationFinished = YES;
+        completions = [_terminationCompletions copy];
+        [_terminationCompletions removeAllObjects];
+    }
+
+    for (dispatch_block_t completion in completions) {
+        dispatch_async(dispatch_get_main_queue(), completion);
+    }
+}
+
 -(void) terminate
+{
+    [self terminateWithCompletion:nil];
+}
+
+-(void) terminateWithCompletion:(dispatch_block_t)completion
 {
     // A Connection can be terminated from several paths (navigation,
     // backgrounding, and common callbacks). Only the first request owns the
     // teardown for this generation.
-    if (atomic_exchange_explicit(&_terminated, true, memory_order_acq_rel)) {
+    BOOL completionAlreadyAvailable = NO;
+    BOOL shouldBeginTermination;
+    @synchronized(self) {
+        if (completion != nil) {
+            if (_terminationFinished) {
+                completionAlreadyAvailable = YES;
+            }
+            else {
+                [_terminationCompletions addObject:[completion copy]];
+            }
+        }
+        shouldBeginTermination = !atomic_exchange_explicit(&_terminated, true, memory_order_acq_rel);
+    }
+
+    if (completionAlreadyAvailable) {
+        dispatch_async(dispatch_get_main_queue(), completion);
+    }
+    if (!shouldBeginTermination) {
         return;
     }
 
@@ -406,6 +444,7 @@ void ClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t
         self->_instanceCallbacks = nil;
 
         [lifecycleLock unlock];
+        [self finishTermination];
     });
 }
 
@@ -431,6 +470,7 @@ void ClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t
     [connectionStateLock unlock];
 
     atomic_init(&_terminated, false);
+    _terminationCompletions = [[NSMutableArray alloc] init];
     _instanceRenderer = myRenderer;
     _instanceCallbacks = callbacks;
     
