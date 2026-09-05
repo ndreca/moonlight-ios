@@ -67,5 +67,6 @@ FOUNDATION_EXPORT BOOL MoonlightHasRecentGCMouseMotion(void);
 +(int) getConnectedGamepadMask:(StreamConfiguration*)streamConfig;
 
 -(NSUInteger) getConnectedGamepadCount;
+-(BOOL) hasActiveControllerStickInput;
 
 @end
