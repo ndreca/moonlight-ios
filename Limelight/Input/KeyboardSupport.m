@@ -8,6 +8,29 @@
 
 #import "KeyboardSupport.h"
 #include <Limelight.h>
+#include <stdatomic.h>
+#include <unistd.h>
+
+static const useconds_t KEY_STROKE_DELAY_US = 50 * 1000;
+static _Atomic(uint64_t) NextKeyboardSessionToken = 1;
+static _Atomic(uint64_t) ActiveKeyboardSessionToken = 0;
+static NSMutableSet<NSNumber *> *HeldNormalizedKeyCodes;
+static NSMutableSet<NSNumber *> *HeldNonNormalizedKeyCodes;
+
+static BOOL KeyboardSessionIsActive(uint64_t sessionToken) {
+    return sessionToken != 0 && atomic_load(&ActiveKeyboardSessionToken) == sessionToken;
+}
+
+static dispatch_queue_t KeyboardEventQueue(void) {
+    static dispatch_queue_t keyboardEventQueue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        keyboardEventQueue = dispatch_queue_create("com.moonlight-stream.Moonlight.keyboard-events", DISPATCH_QUEUE_SERIAL);
+        HeldNormalizedKeyCodes = [[NSMutableSet alloc] init];
+        HeldNonNormalizedKeyCodes = [[NSMutableSet alloc] init];
+    });
+    return keyboardEventQueue;
+}
 
 @implementation KeyboardSupport
 
@@ -36,9 +59,7 @@
                 return NO;
         }
         
-        LiSendKeyboardEvent(0x8000 | keyCode,
-                            down ? KEY_ACTION_DOWN : KEY_ACTION_UP,
-                            0);
+        [KeyboardSupport sendKeyCode:0x8000 | keyCode down:down modifiers:0];
         
         return YES;
     }
@@ -253,15 +274,12 @@
                 break;
             default:
                 NSLog(@"Unhandled HID usage: %lu", (unsigned long)key.keyCode);
-                assert(0);
-                return false;
+                return NO;
         }
     }
-    
-    LiSendKeyboardEvent(0x8000 | keyCode,
-                        down ? KEY_ACTION_DOWN : KEY_ACTION_UP,
-                        modifierFlags);
-    return true;
+
+    [KeyboardSupport sendKeyCode:0x8000 | keyCode down:down modifiers:modifierFlags];
+    return YES;
 }
 
 + (struct KeyEvent)translateKeyEvent:(unichar)inputChar withModifierFlags:(UIKeyModifierFlags)modifierFlags {
@@ -270,22 +288,19 @@
     event.modifier = 0;
     event.modifierKeycode = 0;
     
-    switch (modifierFlags) {
-        case UIKeyModifierAlphaShift:
-        case UIKeyModifierShift:
-            [KeyboardSupport addShiftModifier:&event];
-            break;
-        case UIKeyModifierControl:
-            [KeyboardSupport addControlModifier:&event];
-            break;
-        case UIKeyModifierCommand:
-            [KeyboardSupport addMetaModifier:&event];
-            break;
-        case UIKeyModifierAlternate:
-            [KeyboardSupport addAltModifier:&event];
-            break;
-        case UIKeyModifierNumericPad:
-            break;
+    // UIKeyModifierFlags is a bit mask. Treating it as an enum drops all but
+    // one modifier for shortcuts such as Shift+Control+Tab.
+    if (modifierFlags & (UIKeyModifierAlphaShift | UIKeyModifierShift)) {
+        [KeyboardSupport addShiftModifier:&event];
+    }
+    if (modifierFlags & UIKeyModifierControl) {
+        [KeyboardSupport addControlModifier:&event];
+    }
+    if (modifierFlags & UIKeyModifierCommand) {
+        [KeyboardSupport addMetaModifier:&event];
+    }
+    if (modifierFlags & UIKeyModifierAlternate) {
+        [KeyboardSupport addAltModifier:&event];
     }
     if (inputChar >= 0x30 && inputChar <= 0x39) {
         // Numbers 0-9
@@ -429,23 +444,180 @@
 }
 
 + (void) addShiftModifier:(struct KeyEvent*)event {
-    event->modifier = MODIFIER_SHIFT;
-    event->modifierKeycode = 0x10;
+    event->modifier |= MODIFIER_SHIFT;
+    if (event->modifierKeycode == 0) {
+        event->modifierKeycode = 0x10;
+    }
 }
 
 + (void) addControlModifier:(struct KeyEvent*)event {
-    event->modifier = MODIFIER_CTRL;
-    event->modifierKeycode = 0x11;
+    event->modifier |= MODIFIER_CTRL;
+    if (event->modifierKeycode == 0) {
+        event->modifierKeycode = 0x11;
+    }
 }
 
 + (void) addMetaModifier:(struct KeyEvent*)event {
-    event->modifier = MODIFIER_META;
-    event->modifierKeycode = 0x5B;
+    event->modifier |= MODIFIER_META;
+    if (event->modifierKeycode == 0) {
+        event->modifierKeycode = 0x5B;
+    }
 }
 
 + (void) addAltModifier:(struct KeyEvent*)event {
-    event->modifier = MODIFIER_ALT;
-    event->modifierKeycode = 0x12;
+    event->modifier |= MODIFIER_ALT;
+    if (event->modifierKeycode == 0) {
+        event->modifierKeycode = 0x12;
+    }
+}
+
++ (void)sendKeyCode:(u_short)keyCode down:(BOOL)down modifiers:(u_char)modifiers {
+    uint64_t sessionToken = atomic_load(&ActiveKeyboardSessionToken);
+    if (sessionToken == 0) {
+        return;
+    }
+    dispatch_async(KeyboardEventQueue(), ^{
+        if (!KeyboardSessionIsActive(sessionToken)) {
+            return;
+        }
+        LiSendKeyboardEvent(keyCode,
+                            down ? KEY_ACTION_DOWN : KEY_ACTION_UP,
+                            modifiers);
+        if (down) {
+            [HeldNormalizedKeyCodes addObject:@(keyCode)];
+        }
+        else {
+            [HeldNormalizedKeyCodes removeObject:@(keyCode)];
+        }
+    });
+}
+
++ (void)sendKeyStroke:(u_short)keyCode modifiers:(u_char)modifiers {
+    uint64_t sessionToken = atomic_load(&ActiveKeyboardSessionToken);
+    if (sessionToken == 0) {
+        return;
+    }
+    dispatch_async(KeyboardEventQueue(), ^{
+        if (!KeyboardSessionIsActive(sessionToken)) {
+            return;
+        }
+        LiSendKeyboardEvent(keyCode, KEY_ACTION_DOWN, modifiers);
+        [HeldNormalizedKeyCodes addObject:@(keyCode)];
+        usleep(KEY_STROKE_DELAY_US);
+        if (!KeyboardSessionIsActive(sessionToken)) {
+            return;
+        }
+        LiSendKeyboardEvent(keyCode, KEY_ACTION_UP, modifiers);
+        [HeldNormalizedKeyCodes removeObject:@(keyCode)];
+    });
+}
+
++ (void)sendTranslatedKeyEvent:(struct KeyEvent)event {
+    if (event.keycode == 0) {
+        return;
+    }
+
+    uint64_t sessionToken = atomic_load(&ActiveKeyboardSessionToken);
+    if (sessionToken == 0) {
+        return;
+    }
+
+    dispatch_async(KeyboardEventQueue(), ^{
+        if (!KeyboardSessionIsActive(sessionToken)) {
+            return;
+        }
+        static const u_char modifierFlags[] = {
+            MODIFIER_SHIFT,
+            MODIFIER_CTRL,
+            MODIFIER_ALT,
+            MODIFIER_META,
+        };
+        static const u_short modifierKeyCodes[] = {
+            0x10,
+            0x11,
+            0x12,
+            0x5B,
+        };
+        static const size_t modifierCount = sizeof(modifierFlags) / sizeof(modifierFlags[0]);
+
+        for (size_t i = 0; i < modifierCount; i++) {
+            if (event.modifier & modifierFlags[i]) {
+                LiSendKeyboardEvent(modifierKeyCodes[i], KEY_ACTION_DOWN, event.modifier);
+                [HeldNormalizedKeyCodes addObject:@(modifierKeyCodes[i])];
+            }
+        }
+
+        // Let the host know these are not necessarily normalized to US English scancodes.
+        LiSendKeyboardEvent2(event.keycode,
+                             KEY_ACTION_DOWN,
+                             event.modifier,
+                             SS_KBE_FLAG_NON_NORMALIZED);
+        [HeldNonNormalizedKeyCodes addObject:@(event.keycode)];
+        usleep(KEY_STROKE_DELAY_US);
+        if (!KeyboardSessionIsActive(sessionToken)) {
+            return;
+        }
+        LiSendKeyboardEvent2(event.keycode,
+                             KEY_ACTION_UP,
+                             event.modifier,
+                             SS_KBE_FLAG_NON_NORMALIZED);
+        [HeldNonNormalizedKeyCodes removeObject:@(event.keycode)];
+
+        for (size_t i = modifierCount; i > 0; i--) {
+            if (event.modifier & modifierFlags[i - 1]) {
+                LiSendKeyboardEvent(modifierKeyCodes[i - 1], KEY_ACTION_UP, event.modifier);
+                [HeldNormalizedKeyCodes removeObject:@(modifierKeyCodes[i - 1])];
+            }
+        }
+    });
+}
+
++ (void)sendUtf8Text:(NSString *)text {
+    NSData *utf8Data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (utf8Data.length == 0) {
+        return;
+    }
+
+    uint64_t sessionToken = atomic_load(&ActiveKeyboardSessionToken);
+    if (sessionToken == 0) {
+        return;
+    }
+
+    dispatch_async(KeyboardEventQueue(), ^{
+        if (!KeyboardSessionIsActive(sessionToken)) {
+            return;
+        }
+        LiSendUtf8TextEvent(utf8Data.bytes, (int)utf8Data.length);
+    });
+}
+
++ (uint64_t)beginKeyboardSession {
+    uint64_t sessionToken = atomic_fetch_add(&NextKeyboardSessionToken, 1);
+    atomic_store(&ActiveKeyboardSessionToken, sessionToken);
+    return sessionToken;
+}
+
++ (void)endKeyboardSession:(uint64_t)sessionToken {
+    uint64_t expectedToken = sessionToken;
+    if (!atomic_compare_exchange_strong(&ActiveKeyboardSessionToken, &expectedToken, 0)) {
+        return;
+    }
+
+    // Pending blocks observe the invalid token and become no-ops. This barrier
+    // then releases anything that actually reached the host before teardown.
+    dispatch_sync(KeyboardEventQueue(), ^{
+        for (NSNumber *keyCode in HeldNonNormalizedKeyCodes) {
+            LiSendKeyboardEvent2(keyCode.unsignedShortValue,
+                                 KEY_ACTION_UP,
+                                 0,
+                                 SS_KBE_FLAG_NON_NORMALIZED);
+        }
+        for (NSNumber *keyCode in HeldNormalizedKeyCodes) {
+            LiSendKeyboardEvent(keyCode.unsignedShortValue, KEY_ACTION_UP, 0);
+        }
+        [HeldNonNormalizedKeyCodes removeAllObjects];
+        [HeldNormalizedKeyCodes removeAllObjects];
+    });
 }
 
 @end

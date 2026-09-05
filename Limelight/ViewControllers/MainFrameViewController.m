@@ -6,8 +6,10 @@
 //
 
 @import ImageIO;
+@import GameController;
 
 #import "MainFrameViewController.h"
+#import "AppDelegate.h"
 #import "CryptoManager.h"
 #import "HttpManager.h"
 #import "Connection.h"
@@ -29,6 +31,21 @@
 
 #if !TARGET_OS_TV
 #import "SettingsViewController.h"
+
+@interface MoonlightBrowserControllerState : NSObject
+@property(nonatomic) int lastButtonFlags;
+@property(nonatomic) NSInteger horizontalStickLatch;
+@property(nonatomic) NSInteger verticalStickLatch;
+@property(nonatomic) BOOL menuPressed;
+@property(nonatomic) int rawButtonFlags;
+@property(nonatomic) BOOL rawMenuPressed;
+@property(nonatomic) NSInteger rawHorizontalStickDirection;
+@property(nonatomic) NSInteger rawVerticalStickDirection;
+@property(nonatomic) BOOL awaitingNeutral;
+@end
+
+@implementation MoonlightBrowserControllerState
+@end
 #else
 #import <sys/utsname.h>
 #endif
@@ -36,6 +53,35 @@
 #import <VideoToolbox/VideoToolbox.h>
 
 #include <Limelight.h>
+#include <math.h>
+
+@interface MainFrameViewController ()
+
+- (void)configureBrowsingControllerCallbacks;
+- (void)clearBrowsingControllerCallbacks;
+- (BOOL)beginStreamLaunch;
+
+#if !TARGET_OS_TV
+- (BOOL)browserControllerInputAvailable;
+- (void)handleBrowserControllerSnapshotForController:(GCController *)controller
+                                     buttonFlags:(int)buttonFlags
+                                           menu:(BOOL)menuPressed
+                                          stickX:(float)stickX
+                                          stickY:(float)stickY;
+- (void)resetBrowserControllerSelection;
+- (void)updateBrowserControllerSelectionAtIndexPath:(NSIndexPath *)indexPath animated:(BOOL)animated;
+- (void)moveBrowserControllerSelectionHorizontal:(NSInteger)horizontal vertical:(NSInteger)vertical;
+- (void)activateBrowserControllerSelection;
+- (void)toggleSettingsFromController;
+- (void)openSettingsOverlay;
+- (void)dismissSettingsOverlay;
+- (UIView *)navigationGlassControlWithImageName:(NSString *)imageName
+                                         action:(SEL)action
+                             accessibilityLabel:(NSString *)accessibilityLabel
+                        accessibilityIdentifier:(NSString *)accessibilityIdentifier;
+#endif
+
+@end
 
 @implementation MainFrameViewController {
     NSOperationQueue* _opQueue;
@@ -51,13 +97,40 @@
     UIScrollView* hostScrollView;
     FrontViewPosition currentPosition;
     NSArray* _sortedAppList;
+    NSArray* _sortedHostList;
     NSCache* _boxArtCache;
     bool _background;
+    BOOL _showingHosts;
+    BOOL _streamLaunchInProgress;
+    CGSize _lastCollectionBoundsSize;
+#if !TARGET_OS_TV
+    id _browserControllerConnectObserver;
+    id _browserControllerDisconnectObserver;
+    dispatch_queue_t _browserControllerQueue;
+    uint64_t _browserControllerGeneration;
+    BOOL _browserControllerOwnershipActive;
+    NSMutableDictionary<NSValue *, MoonlightBrowserControllerState *> *_browserControllerStates;
+    NSIndexPath *_browserControllerIndexPath;
+    CFTimeInterval _lastBrowserControllerActivationTime;
+    UINavigationController *_settingsOverlayController;
+    UIBarButtonItem *_backButtonItem;
+#endif
 #if TARGET_OS_TV
     UITapGestureRecognizer* _menuRecognizer;
 #endif
 }
 static NSMutableSet* hostList;
+
+#if !TARGET_OS_TV
+enum {
+    BrowserButtonA     = 1 << 0,
+    BrowserButtonB     = 1 << 1,
+    BrowserButtonUp    = 1 << 2,
+    BrowserButtonDown  = 1 << 3,
+    BrowserButtonLeft  = 1 << 4,
+    BrowserButtonRight = 1 << 5,
+};
+#endif
 
 - (void)startPairing:(NSString *)PIN {
     // Needs to be synchronous to ensure the alert is shown before any potential
@@ -118,13 +191,14 @@ static NSMutableSet* hostList;
 
 - (void)disableUpButton {
 #if !TARGET_OS_TV
-    [self->_upButton setTitle:nil];
+    self.navigationItem.rightBarButtonItem = nil;
+    self.navigationItem.rightBarButtonItems = @[];
 #endif
 }
 
 - (void)enableUpButton {
 #if !TARGET_OS_TV
-    [self->_upButton setTitle:@"Select New Host"];
+    self.navigationItem.rightBarButtonItem = _backButtonItem;
 #endif
 }
 
@@ -133,10 +207,10 @@ static NSMutableSet* hostList;
         self.title = _selectedHost.name;
     }
     else if ([hostList count] == 0) {
-        self.title = @"Searching for PCs on your network...";
+        self.title = @"Looking for computers…";
     }
     else {
-        self.title = @"Select Host";
+        self.title = @"Computers";
     }
 }
 
@@ -298,12 +372,25 @@ static NSMutableSet* hostList;
     _showHiddenApps = NO;
     _selectedHost = nil;
     _sortedAppList = nil;
+    _showingHosts = YES;
+#if !TARGET_OS_TV
+    [self resetBrowserControllerSelection];
+#endif
     
     [self updateTitle];
     [self disableUpButton];
     
     [self.collectionView reloadData];
+#if !TARGET_OS_TV
+    if (_browserControllerStates.count > 0 &&
+        [self collectionView:self.collectionView numberOfItemsInSection:0] > 0) {
+        [self updateBrowserControllerSelectionAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:0]
+                                                 animated:NO];
+    }
+#endif
+#if TARGET_OS_TV
     [self.view addSubview:hostScrollView];
+#endif
 }
 
 - (void) receivedAssetForApp:(TemporaryApp*)app {
@@ -436,7 +523,12 @@ static NSMutableSet* hostList;
 }
 
 - (UIViewController*) activeViewController {
-    UIViewController *topController = [UIApplication sharedApplication].keyWindow.rootViewController;
+    UIWindow *window = self.view.window;
+    if (window == nil) {
+        AppDelegate *appDelegate = (AppDelegate *)UIApplication.sharedApplication.delegate;
+        window = appDelegate.activeWindow;
+    }
+    UIViewController *topController = window.rootViewController;
 
     while (topController.presentedViewController) {
         topController = topController.presentedViewController;
@@ -475,7 +567,11 @@ static NSMutableSet* hostList;
     if (host.state != StateOnline) {
         [longClickAlert addAction:[UIAlertAction actionWithTitle:@"Wake PC" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
             UIAlertController* wolAlert = [UIAlertController alertControllerWithTitle:@"Wake-On-LAN" message:@"" preferredStyle:UIAlertControllerStyleAlert];
-            [wolAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [wolAlert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                         style:UIAlertActionStyleDefault
+                                                       handler:^(UIAlertAction *okAction) {
+                [self configureBrowsingControllerCallbacks];
+            }]];
             if (host.mac == nil || [host.mac isEqualToString:@"00:00:00:00:00:00"]) {
                 wolAlert.message = @"Host MAC unknown, unable to send WOL Packet";
             } else {
@@ -489,6 +585,7 @@ static NSMutableSet* hostList;
     }
     else if (host.pairState == PairStatePaired) {
         [longClickAlert addAction:[UIAlertAction actionWithTitle:@"View All Apps" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
+            [self configureBrowsingControllerCallbacks];
             self->_showHiddenApps = YES;
             [self hostClicked:host view:view];
         }]];
@@ -496,6 +593,7 @@ static NSMutableSet* hostList;
 #if !TARGET_OS_TV
         if (host.isNvidiaServerSoftware) {
             [longClickAlert addAction:[UIAlertAction actionWithTitle:@"NVIDIA GameStream End-of-Service" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
+                [self configureBrowsingControllerCallbacks];
                 [Utils launchUrl:@"https://github.com/moonlight-stream/moonlight-docs/wiki/NVIDIA-GameStream-End-Of-Service-Announcement-FAQ"];
             }]];
         }
@@ -523,7 +621,11 @@ static NSMutableSet* hostList;
                         }
                         
                         UIAlertController* netTestAlert = [UIAlertController alertControllerWithTitle:@"Network Test Complete" message:message preferredStyle:UIAlertControllerStyleAlert];
-                        [netTestAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                        [netTestAlert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                                        style:UIAlertActionStyleDefault
+                                                                      handler:^(UIAlertAction *okAction) {
+                            [self configureBrowsingControllerCallbacks];
+                        }]];
                         [[self activeViewController] presentViewController:netTestAlert animated:YES completion:nil];
                     }];
                 });
@@ -533,14 +635,17 @@ static NSMutableSet* hostList;
 #if !TARGET_OS_TV
     if (host.state != StateOnline) {
         [longClickAlert addAction:[UIAlertAction actionWithTitle:@"NVIDIA GameStream End-of-Service" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
+            [self configureBrowsingControllerCallbacks];
             [Utils launchUrl:@"https://github.com/moonlight-stream/moonlight-docs/wiki/NVIDIA-GameStream-End-Of-Service-Announcement-FAQ"];
         }]];
         [longClickAlert addAction:[UIAlertAction actionWithTitle:@"Connection Help" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
+            [self configureBrowsingControllerCallbacks];
             [Utils launchUrl:@"https://github.com/moonlight-stream/moonlight-docs/wiki/Troubleshooting"];
         }]];
     }
 #endif
     [longClickAlert addAction:[UIAlertAction actionWithTitle:@"Remove Host" style:UIAlertActionStyleDestructive handler:^(UIAlertAction* action) {
+        [self configureBrowsingControllerCallbacks];
         [self->_discMan removeHostFromDiscovery:host];
         DataManager* dataMan = [[DataManager alloc] init];
         [dataMan removeHost:host];
@@ -550,20 +655,31 @@ static NSMutableSet* hostList;
         }
         
     }]];
-    [longClickAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [longClickAlert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                       style:UIAlertActionStyleCancel
+                                                     handler:^(UIAlertAction *action) {
+        [self configureBrowsingControllerCallbacks];
+    }]];
     
     // these two lines are required for iPad support of UIAlertSheet
     longClickAlert.popoverPresentationController.sourceView = view;
     
     longClickAlert.popoverPresentationController.sourceRect = CGRectMake(view.bounds.size.width / 2.0, view.bounds.size.height / 2.0, 1.0, 1.0); // center of the view
+    [self clearBrowsingControllerCallbacks];
     [[self activeViewController] presentViewController:longClickAlert animated:YES completion:nil];
+    longClickAlert.presentationController.delegate = self;
 }
 
 - (void) addHostClicked {
     Log(LOG_D, @"Clicked add host");
     UIAlertController* alertController = [UIAlertController alertControllerWithTitle:@"Add Host Manually" message:@"If Moonlight doesn't find your local gaming PC automatically,\nenter the IP address of your PC" preferredStyle:UIAlertControllerStyleAlert];
-    [alertController addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alertController addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                        style:UIAlertActionStyleCancel
+                                                      handler:^(UIAlertAction *action) {
+        [self configureBrowsingControllerCallbacks];
+    }]];
     [alertController addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
+        [self configureBrowsingControllerCallbacks];
         NSString* hostAddress = [((UITextField*)[[alertController textFields] objectAtIndex:0]).text trim];
         [self showLoadingFrame:^{
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
@@ -598,6 +714,7 @@ static NSMutableSet* hostList;
         }];
     }]];
     [alertController addTextFieldWithConfigurationHandler:nil];
+    [self clearBrowsingControllerCallbacks];
     [[self activeViewController] presentViewController:alertController animated:YES completion:nil];
 }
 
@@ -702,6 +819,20 @@ static NSMutableSet* hostList;
 #endif
 }
 
+- (BOOL)beginStreamLaunch {
+    if (_streamLaunchInProgress) {
+        Log(LOG_W, @"Ignoring duplicate stream launch activation");
+        return NO;
+    }
+
+    _streamLaunchInProgress = YES;
+    self.collectionView.userInteractionEnabled = NO;
+#if !TARGET_OS_TV
+    [self clearBrowsingControllerCallbacks];
+#endif
+    return YES;
+}
+
 - (void)appLongClicked:(TemporaryApp *)app view:(UIView *)view {
     Log(LOG_D, @"Long clicked app: %@", app.name);
     
@@ -732,13 +863,27 @@ static NSMutableSet* hostList;
         message = [NSString stringWithFormat:@"%@ is currently running", currentApp.name];
     }
     
+    UIAlertControllerStyle alertStyle = UIAlertControllerStyleActionSheet;
+#if !TARGET_OS_TV
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone &&
+        self.traitCollection.verticalSizeClass == UIUserInterfaceSizeClassCompact) {
+        // iOS 27's glass action-sheet host exceeds the compact landscape
+        // height by two points and emits broken-constraint diagnostics.
+        alertStyle = UIAlertControllerStyleAlert;
+    }
+#endif
+
     UIAlertController* alertController = [UIAlertController
                                           alertControllerWithTitle: app.name
                                           message:message
-                                          preferredStyle:UIAlertControllerStyleActionSheet];
+                                          preferredStyle:alertStyle];
     
     [alertController addAction:[UIAlertAction
                                 actionWithTitle:currentApp == nil ? @"Launch App" : ([app.id isEqualToString:currentApp.id] ? @"Resume App" : @"Resume Running App") style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
+        if (![self beginStreamLaunch]) {
+            return;
+        }
+        [self configureBrowsingControllerCallbacks];
         if (currentApp != nil) {
             Log(LOG_I, @"Resuming application: %@", currentApp.name);
             [self prepareToStreamApp:currentApp];
@@ -754,6 +899,7 @@ static NSMutableSet* hostList;
     if (currentApp != nil) {
         [alertController addAction:[UIAlertAction actionWithTitle:
                                     [app.id isEqualToString:currentApp.id] ? @"Quit App" : @"Quit Running App and Start" style:UIAlertActionStyleDestructive handler:^(UIAlertAction* action){
+                                        [self configureBrowsingControllerCallbacks];
                                         Log(LOG_I, @"Quitting application: %@", currentApp.name);
                                         [self showLoadingFrame: ^{
                                             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -800,6 +946,10 @@ static NSMutableSet* hostList;
                                                     dispatch_async(dispatch_get_main_queue(), ^{
                                                         // If it succeeds and we're to start streaming, segue to the stream
                                                         if (![app.id isEqualToString:currentApp.id]) {
+                                                            if (![self beginStreamLaunch]) {
+                                                                [self hideLoadingFrame:nil];
+                                                                return;
+                                                            }
                                                             [self prepareToStreamApp:app];
                                                             [self hideLoadingFrame: ^{
                                                                 [self performSegueWithIdentifier:@"createStreamFrame" sender:nil];
@@ -821,6 +971,7 @@ static NSMutableSet* hostList;
         [alertController addAction:[UIAlertAction actionWithTitle:app.hidden ? @"Show App" : @"Hide App"
                                                             style:app.hidden ? UIAlertActionStyleDefault : UIAlertActionStyleDestructive
                                                           handler:^(UIAlertAction* action) {
+            [self configureBrowsingControllerCallbacks];
             app.hidden = !app.hidden;
             [self updateAppEntry:app forHost:app.host];
             
@@ -829,13 +980,26 @@ static NSMutableSet* hostList;
         }]];
     }
     
-    [alertController addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alertController addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                        style:UIAlertActionStyleCancel
+                                                      handler:^(UIAlertAction *action) {
+        [self configureBrowsingControllerCallbacks];
+    }]];
 
-    // these two lines are required for iPad support of UIAlertSheet
-    alertController.popoverPresentationController.sourceView = view;
-    
-    alertController.popoverPresentationController.sourceRect = CGRectMake(view.bounds.size.width / 2.0, view.bounds.size.height / 2.0, 1.0, 1.0); // center of the view
+    if (alertController.popoverPresentationController != nil) {
+        UIView *sourceView = view ?: self.collectionView;
+        alertController.popoverPresentationController.sourceView = sourceView;
+        alertController.popoverPresentationController.sourceRect =
+            CGRectMake(CGRectGetMidX(sourceView.bounds), CGRectGetMidY(sourceView.bounds), 1.0, 1.0);
+    }
+    [self clearBrowsingControllerCallbacks];
     [[self activeViewController] presentViewController:alertController animated:YES completion:nil];
+    if (alertStyle == UIAlertControllerStyleActionSheet) {
+        // iOS 27 forbids changing the presentation-controller delegate of an
+        // alert-style UIAlertController. Action sheets still need dismissal
+        // callbacks for iPad popover/tap-outside dismissal.
+        alertController.presentationController.delegate = self;
+    }
 }
 
 - (void) appClicked:(TemporaryApp *)app view:(UIView *)view {
@@ -856,6 +1020,9 @@ static NSMutableSet* hostList;
         // If there's a running app, display a menu
         [self appLongClicked:app view:view];
     } else {
+        if (![self beginStreamLaunch]) {
+            return;
+        }
         [self prepareToStreamApp:app];
         [self performSegueWithIdentifier:@"createStreamFrame" sender:nil];
     }
@@ -876,19 +1043,47 @@ static NSMutableSet* hostList;
     if (position == FrontViewPositionLeft) {
         [(SettingsViewController*)[revealController rearViewController] saveSettings];
     }
+
+    BOOL settingsVisible = position != FrontViewPositionLeft;
+    revealController.frontViewController.view.accessibilityElementsHidden = settingsVisible;
+    revealController.rearViewController.view.accessibilityViewIsModal = settingsVisible;
+    if (settingsVisible) {
+        UIAccessibilityPostNotification(UIAccessibilityScreenChangedNotification,
+                                        revealController.rearViewController.view);
+    }
+    [revealController setNeedsFocusUpdate];
     
     currentPosition = position;
 }
 #endif
 
-#if TARGET_OS_TV
 - (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)indexPath {
+#if TARGET_OS_TV
     [self appClicked:_sortedAppList[indexPath.row] view:nil];
-}
+#else
+    UIView *sourceView = [collectionView cellForItemAtIndexPath:indexPath].contentView.subviews.firstObject;
+    if (_showingHosts) {
+        if (indexPath.item < _sortedHostList.count) {
+            [self hostClicked:_sortedHostList[indexPath.item] view:sourceView];
+        }
+        else {
+            [self addHostClicked];
+        }
+    }
+    else if (indexPath.item < _sortedAppList.count) {
+        [self appClicked:_sortedAppList[indexPath.item] view:sourceView];
+    }
 #endif
+}
 
 - (void)prepareForSegue:(UIStoryboardSegue *)segue sender:(id)sender {
     if ([segue.destinationViewController isKindOfClass:[StreamFrameViewController class]]) {
+#if !TARGET_OS_TV
+        // Release browser-level Menu/B ownership before the stream installs its
+        // controller handlers. Doing this here avoids racing StreamFrame's
+        // viewDidLoad registration from MainFrame's later disappearance.
+        [self clearBrowsingControllerCallbacks];
+#endif
         StreamFrameViewController* streamFrame = segue.destinationViewController;
         streamFrame.streamConfig = _streamConfig;
     }
@@ -904,10 +1099,28 @@ static NSMutableSet* hostList;
 }
 
 - (void)adjustScrollViewForSafeArea:(UIScrollView*)view {
+    if (view == nil) {
+        return;
+    }
+
     if (@available(iOS 11.0, *)) {
-        if (self.view.safeAreaInsets.left >= 20 || self.view.safeAreaInsets.right >= 20) {
-            view.contentInset = UIEdgeInsetsMake(0, 20, 0, 20);
+        view.contentInset = UIEdgeInsetsZero;
+#if !TARGET_OS_TV
+        // The grid already keeps cards inside the safe area through its section
+        // insets. Letting UIKit apply those insets again to the indicator placed
+        // the thumb over the last app column in landscape.
+        if (@available(iOS 13.0, *)) {
+            view.automaticallyAdjustsScrollIndicatorInsets = NO;
         }
+        UIEdgeInsets safeArea = self.view.safeAreaInsets;
+        view.verticalScrollIndicatorInsets = UIEdgeInsetsMake(10.0,
+                                                               0,
+                                                               MAX(10.0, safeArea.bottom + 8.0),
+                                                               6.0);
+        view.horizontalScrollIndicatorInsets = UIEdgeInsetsMake(0, 10.0, 6.0, 10.0);
+#else
+        view.scrollIndicatorInsets = self.view.safeAreaInsets;
+#endif
     }
 }
 
@@ -917,31 +1130,83 @@ static NSMutableSet* hostList;
     
     [self adjustScrollViewForSafeArea:self.collectionView];
     [self adjustScrollViewForSafeArea:self->hostScrollView];
+    _lastCollectionBoundsSize = CGSizeZero;
+    [self.collectionView.collectionViewLayout invalidateLayout];
 }
 
 - (void)viewDidLoad
 {
     [super viewDidLoad];
+
+    self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    _showingHosts = YES;
+    self.collectionView.backgroundColor = [UIColor colorWithRed:0.055 green:0.060 blue:0.075 alpha:1.0];
+#if !TARGET_OS_TV
+    self.collectionView.indicatorStyle = UIScrollViewIndicatorStyleWhite;
+#endif
+    self.collectionView.alwaysBounceVertical = YES;
+    self.collectionView.delaysContentTouches = NO;
+    self.collectionView.allowsMultipleSelection = NO;
+
+#if !TARGET_OS_TV
+    if (@available(iOS 15.0, *)) {
+        self.collectionView.allowsFocus = YES;
+        self.collectionView.remembersLastFocusedIndexPath = YES;
+        self.collectionView.selectionFollowsFocus = NO;
+    }
+
+    UICollectionViewFlowLayout *layout = (UICollectionViewFlowLayout *)self.collectionView.collectionViewLayout;
+    if ([layout isKindOfClass:[UICollectionViewFlowLayout class]]) {
+        layout.minimumInteritemSpacing = 16.0;
+        layout.minimumLineSpacing = 20.0;
+        layout.sectionInset = UIEdgeInsetsMake(24, 24, 28, 24);
+    }
+#endif
         
 #if !TARGET_OS_TV
-    // Set the side bar button action. When it's tapped, it'll show the sidebar.
-    [_settingsButton setTarget:self.revealViewController];
-    [_settingsButton setAction:@selector(revealToggle:)];
+    [_settingsButton setTarget:self];
+    [_settingsButton setAction:@selector(openSettingsOverlay)];
     
     // Set the host name button action. When it's tapped, it'll show the host selection view.
     [_upButton setTarget:self];
     [_upButton setAction:@selector(showHostSelectionView)];
-    [self disableUpButton];
     
-    // Set the gesture
-    [self.view addGestureRecognizer:self.revealViewController.panGestureRecognizer];
-    
-    // Get callbacks associated with the viewController
     [self.revealViewController setDelegate:self];
-    
-    // Disable bounce-back on reveal VC otherwise the settings will snap closed
-    // if the user drags all the way off the screen opposite the settings pane.
-    self.revealViewController.bounceBackOnOverdraw = NO;
+
+    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    [appearance configureWithOpaqueBackground];
+    appearance.backgroundColor = [UIColor colorWithRed:0.055 green:0.060 blue:0.075 alpha:1.0];
+    appearance.shadowColor = UIColor.clearColor;
+    appearance.titleTextAttributes = @{
+        NSForegroundColorAttributeName: UIColor.whiteColor,
+        NSFontAttributeName: [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold],
+    };
+    self.navigationController.navigationBar.standardAppearance = appearance;
+    self.navigationController.navigationBar.scrollEdgeAppearance = appearance;
+    self.navigationController.navigationBar.compactAppearance = appearance;
+    self.navigationController.navigationBar.tintColor = [UIColor colorWithRed:0.55 green:0.48 blue:0.96 alpha:1.0];
+
+    _settingsButton.customView = [self navigationGlassControlWithImageName:@"gearshape.fill"
+                                                                    action:@selector(openSettingsOverlay)
+                                                        accessibilityLabel:@"Settings"
+                                                   accessibilityIdentifier:@"settings.open"];
+    if (@available(iOS 26.0, *)) {
+        _settingsButton.hidesSharedBackground = YES;
+    }
+    _settingsButton.accessibilityLabel = @"Settings";
+    _settingsButton.accessibilityIdentifier = @"settings.open";
+
+    _upButton.customView = [self navigationGlassControlWithImageName:@"chevron.backward"
+                                                               action:@selector(showHostSelectionView)
+                                                   accessibilityLabel:@"Back to computers"
+                                              accessibilityIdentifier:@"host.back"];
+    if (@available(iOS 26.0, *)) {
+        _upButton.hidesSharedBackground = YES;
+    }
+    _upButton.accessibilityLabel = @"Back to computers";
+    _upButton.accessibilityIdentifier = @"host.back";
+    _backButtonItem = _upButton;
+    [self disableUpButton];
 #else
     // The settings button will direct the user into the Settings app on tvOS
     [_settingsButton setTarget:self];
@@ -978,16 +1243,14 @@ static NSMutableSet* hostList;
     
     _boxArtCache = [[NSCache alloc] init];
         
+#if !TARGET_OS_TV
+    self.collectionView.multipleTouchEnabled = NO;
+#else
     hostScrollView = [[ComputerScrollView alloc] init];
     hostScrollView.frame = CGRectMake(0, self.navigationController.navigationBar.frame.origin.y + self.navigationController.navigationBar.frame.size.height, self.view.frame.size.width, self.view.frame.size.height / 2);
     [hostScrollView setShowsHorizontalScrollIndicator:NO];
     hostScrollView.delaysContentTouches = NO;
-    
-    self.collectionView.delaysContentTouches = NO;
-    self.collectionView.allowsMultipleSelection = NO;
-#if !TARGET_OS_TV
-    self.collectionView.multipleTouchEnabled = NO;
-#else
+
     // This is the only way to get long press events on a UICollectionViewCell :(
     UILongPressGestureRecognizer* cellLongPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleCollectionViewLongPress:)];
     cellLongPress.delaysTouchesBegan = YES;
@@ -997,13 +1260,16 @@ static NSMutableSet* hostList;
     [self retrieveSavedHosts];
     _discMan = [[DiscoveryManager alloc] initWithHosts:[hostList allObjects] andCallback:self];
         
+    [self updateTitle];
+#if TARGET_OS_TV
     if ([hostList count] == 1) {
         [self hostClicked:[hostList anyObject] view:nil];
-    }
-    else {
-        [self updateTitle];
+    } else {
         [self.view addSubview:hostScrollView];
     }
+#else
+    [self updateHosts];
+#endif
 }
 
 #if TARGET_OS_TV
@@ -1075,9 +1341,24 @@ static NSMutableSet* hostList;
     }
 }
 
+#if !TARGET_OS_TV
+-(void)handleShortcutItemReceived:(NSNotification *)notification
+{
+    (void)notification;
+    [self handlePendingShortcutAction];
+}
+#endif
+
 -(void)handleReturnToForeground
 {
     _background = NO;
+
+#if !TARGET_OS_TV
+    if (self.presentedViewController == nil &&
+        _settingsOverlayController.presentingViewController == nil) {
+        [self configureBrowsingControllerCallbacks];
+    }
+#endif
     
     [self beginForegroundRefresh];
     
@@ -1098,14 +1379,14 @@ static NSMutableSet* hostList;
     
 #if !TARGET_OS_TV
     [[self revealViewController] setPrimaryViewController:self];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleShortcutItemReceived:)
+                                                 name:MoonlightShortcutItemReceivedNotification
+                                               object:nil];
 #endif
     
-    [self.navigationController setNavigationBarHidden:NO animated:YES];
-    
-    // Hide 1px border line
-    UIImage* fakeImage = [[UIImage alloc] init];
-    [self.navigationController.navigationBar setShadowImage:fakeImage];
-    [self.navigationController.navigationBar setBackgroundImage:fakeImage forBarPosition:UIBarPositionAny barMetrics:UIBarMetricsDefault];
+    [self.navigationController setNavigationBarHidden:NO animated:NO];
     
     // Check for a pending shortcut action when appearing
     [self handlePendingShortcutAction];
@@ -1119,11 +1400,18 @@ static NSMutableSet* hostList;
                                              selector: @selector(handleEnterBackground)
                                                  name: UIApplicationWillResignActiveNotification
                                                object: nil];
+
+#if !TARGET_OS_TV
+    [self configureBrowsingControllerCallbacks];
+#endif
 }
 
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
+    _streamLaunchInProgress = NO;
+    self.collectionView.userInteractionEnabled = YES;
+    [self.navigationController setNavigationBarHidden:NO animated:NO];
     
     // We can get here on home press while streaming
     // since the stream view segues to us just before
@@ -1137,6 +1425,24 @@ static NSMutableSet* hostList;
     // view, so we won't get a return to active notification
     // for that which would normally fire beginForegroundRefresh.
     [self beginForegroundRefresh];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+
+#if !TARGET_OS_TV
+    // The legacy reveal container remains the storyboard root for compatibility,
+    // but Settings is presented as a native overlay instead of resizing the browser.
+#endif
+
+    if (!CGSizeEqualToSize(_lastCollectionBoundsSize, self.collectionView.bounds.size)) {
+        _lastCollectionBoundsSize = self.collectionView.bounds.size;
+        [self.collectionView.collectionViewLayout invalidateLayout];
+    }
+}
+
+- (BOOL)prefersStatusBarHidden {
+    return YES;
 }
 
 - (void)viewDidDisappear:(BOOL)animated
@@ -1153,7 +1459,601 @@ static NSMutableSet* hostList;
     // Remove our lifetime observers to avoid triggering them
     // while streaming
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+
 }
+
+#if !TARGET_OS_TV
+- (UIView *)navigationGlassControlWithImageName:(NSString *)imageName
+                                         action:(SEL)action
+                             accessibilityLabel:(NSString *)accessibilityLabel
+                        accessibilityIdentifier:(NSString *)accessibilityIdentifier {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+    button.frame = CGRectMake(0, 0, 48, 48);
+    button.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    button.accessibilityLabel = accessibilityLabel;
+    button.accessibilityIdentifier = accessibilityIdentifier;
+
+    UIImageSymbolConfiguration *symbolConfiguration = [UIImageSymbolConfiguration configurationWithPointSize:20
+                                                                                                        weight:UIImageSymbolWeightSemibold];
+    UIImage *symbol = [UIImage systemImageNamed:imageName withConfiguration:symbolConfiguration];
+    symbol = [symbol imageWithTintColor:UIColor.whiteColor renderingMode:UIImageRenderingModeAlwaysOriginal];
+    [button setImage:symbol forState:UIControlStateNormal];
+    [button addTarget:self action:action forControlEvents:UIControlEventPrimaryActionTriggered];
+
+    if (@available(iOS 26.0, *)) {
+        UIGlassEffect *effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
+        effect.interactive = YES;
+        effect.tintColor = [UIColor colorWithRed:0.035 green:0.040 blue:0.055 alpha:0.82];
+
+        UIVisualEffectView *glassView = [[UIVisualEffectView alloc] initWithEffect:effect];
+        glassView.frame = CGRectMake(0, 0, 48, 48);
+        glassView.layer.cornerRadius = 24.0;
+        glassView.layer.cornerCurve = kCACornerCurveContinuous;
+        glassView.layer.masksToBounds = YES;
+        glassView.layer.borderWidth = 1.0;
+        glassView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.12].CGColor;
+        [glassView.contentView addSubview:button];
+        button.frame = glassView.contentView.bounds;
+        return glassView;
+    }
+
+    UIVisualEffectView *materialView = [[UIVisualEffectView alloc]
+        initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark]];
+    materialView.frame = CGRectMake(0, 0, 48, 48);
+    materialView.layer.cornerRadius = 24.0;
+    materialView.layer.cornerCurve = kCACornerCurveContinuous;
+    materialView.layer.masksToBounds = YES;
+    materialView.layer.borderWidth = 1.0;
+    materialView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.13].CGColor;
+    [materialView.contentView addSubview:button];
+    button.frame = materialView.contentView.bounds;
+    return materialView;
+}
+
+- (BOOL)browserControllerInputAvailable {
+    return self.view.window != nil &&
+           !_background &&
+           UIApplication.sharedApplication.applicationState == UIApplicationStateActive &&
+           ![_loadingFrame isShown] &&
+           self.presentedViewController == nil &&
+           _settingsOverlayController.presentingViewController == nil &&
+           [self collectionView:self.collectionView numberOfItemsInSection:0] > 0;
+}
+
+- (void)resetBrowserControllerSelection {
+    _browserControllerIndexPath = nil;
+    for (MoonlightBrowserControllerState *state in _browserControllerStates.allValues) {
+        state.horizontalStickLatch = 0;
+        state.verticalStickLatch = 0;
+    }
+    for (UICollectionViewCell *cell in self.collectionView.visibleCells) {
+        UIControl *control = (UIControl *)cell.contentView.subviews.firstObject;
+        if ([control isKindOfClass:[UIAppView class]]) {
+            [(UIAppView *)control setControllerHighlighted:NO];
+        }
+        else if ([control isKindOfClass:[UIComputerView class]]) {
+            [(UIComputerView *)control setControllerHighlighted:NO];
+        }
+    }
+}
+
+- (void)updateBrowserControllerSelectionAtIndexPath:(NSIndexPath *)indexPath animated:(BOOL)animated {
+    NSInteger itemCount = [self collectionView:self.collectionView numberOfItemsInSection:0];
+    if (indexPath == nil || indexPath.item < 0 || indexPath.item >= itemCount) {
+        return;
+    }
+
+    _browserControllerIndexPath = indexPath;
+
+    [self.collectionView layoutIfNeeded];
+    UICollectionViewLayoutAttributes *attributes =
+        [self.collectionView.collectionViewLayout layoutAttributesForItemAtIndexPath:indexPath];
+    CGRect visibleBounds = (CGRect){self.collectionView.contentOffset, self.collectionView.bounds.size};
+    if (attributes != nil && !CGRectContainsRect(visibleBounds, attributes.frame)) {
+        [self.collectionView scrollToItemAtIndexPath:indexPath
+                                    atScrollPosition:UICollectionViewScrollPositionCenteredVertically
+                                            animated:animated];
+    }
+
+    void (^refreshHighlights)(void) = ^{
+        for (UICollectionViewCell *cell in self.collectionView.visibleCells) {
+            NSIndexPath *visibleIndexPath = [self.collectionView indexPathForCell:cell];
+            BOOL highlighted = [visibleIndexPath isEqual:self->_browserControllerIndexPath];
+            UIControl *control = (UIControl *)cell.contentView.subviews.firstObject;
+            if ([control isKindOfClass:[UIAppView class]]) {
+                [(UIAppView *)control setControllerHighlighted:highlighted];
+            }
+            else if ([control isKindOfClass:[UIComputerView class]]) {
+                [(UIComputerView *)control setControllerHighlighted:highlighted];
+            }
+        }
+    };
+
+    [UIView animateWithDuration:animated ? 0.16 : 0.0 animations:refreshHighlights];
+    if (animated) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(180 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), refreshHighlights);
+    }
+}
+
+- (void)moveBrowserControllerSelectionHorizontal:(NSInteger)horizontal vertical:(NSInteger)vertical {
+    if (![self browserControllerInputAvailable] || (horizontal == 0 && vertical == 0)) {
+        return;
+    }
+
+    NSInteger itemCount = [self collectionView:self.collectionView numberOfItemsInSection:0];
+    if (_browserControllerIndexPath == nil || _browserControllerIndexPath.item >= itemCount) {
+        [self updateBrowserControllerSelectionAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:0]
+                                                 animated:NO];
+        return;
+    }
+
+    [self.collectionView layoutIfNeeded];
+    UICollectionViewLayout *layout = self.collectionView.collectionViewLayout;
+    UICollectionViewLayoutAttributes *currentAttributes =
+        [layout layoutAttributesForItemAtIndexPath:_browserControllerIndexPath];
+    if (currentAttributes == nil) {
+        return;
+    }
+
+    CGPoint currentCenter = currentAttributes.center;
+    CGFloat bestScore = CGFLOAT_MAX;
+    NSIndexPath *bestIndexPath = nil;
+    for (NSInteger item = 0; item < itemCount; item++) {
+        if (item == _browserControllerIndexPath.item) {
+            continue;
+        }
+        NSIndexPath *candidateIndexPath = [NSIndexPath indexPathForItem:item inSection:0];
+        UICollectionViewLayoutAttributes *candidateAttributes =
+            [layout layoutAttributesForItemAtIndexPath:candidateIndexPath];
+        if (candidateAttributes == nil) {
+            continue;
+        }
+
+        CGFloat deltaX = candidateAttributes.center.x - currentCenter.x;
+        CGFloat deltaY = candidateAttributes.center.y - currentCenter.y;
+        CGFloat forwardDistance = deltaX * horizontal + deltaY * vertical;
+        if (forwardDistance <= 1.0) {
+            continue;
+        }
+        CGFloat crossDistance = fabs(deltaX * vertical - deltaY * horizontal);
+        CGFloat score = forwardDistance + crossDistance * 4.0;
+        if (score < bestScore) {
+            bestScore = score;
+            bestIndexPath = candidateIndexPath;
+        }
+    }
+
+    if (bestIndexPath != nil) {
+        [self updateBrowserControllerSelectionAtIndexPath:bestIndexPath animated:YES];
+        UISelectionFeedbackGenerator *feedback = [[UISelectionFeedbackGenerator alloc] init];
+        [feedback selectionChanged];
+    }
+}
+
+- (void)activateBrowserControllerSelection {
+    if (![self browserControllerInputAvailable]) {
+        return;
+    }
+
+    if (_browserControllerIndexPath == nil) {
+        [self updateBrowserControllerSelectionAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:0]
+                                                 animated:NO];
+    }
+
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - _lastBrowserControllerActivationTime < 0.20) {
+        return;
+    }
+    _lastBrowserControllerActivationTime = now;
+    [self collectionView:self.collectionView didSelectItemAtIndexPath:_browserControllerIndexPath];
+}
+
+- (void)handleBrowserControllerSnapshotForController:(GCController *)controller
+                                     buttonFlags:(int)buttonFlags
+                                           menu:(BOOL)menuPressed
+                                          stickX:(float)stickX
+                                          stickY:(float)stickY {
+    NSValue *controllerKey = [NSValue valueWithNonretainedObject:controller];
+    MoonlightBrowserControllerState *state = _browserControllerStates[controllerKey];
+    if (state == nil) {
+        return;
+    }
+
+    if (state.awaitingNeutral) {
+        state.lastButtonFlags = buttonFlags;
+        state.menuPressed = menuPressed;
+        if (buttonFlags == 0 && !menuPressed && stickX == 0 && stickY == 0) {
+            state.awaitingNeutral = NO;
+            state.horizontalStickLatch = 0;
+            state.verticalStickLatch = 0;
+        }
+        return;
+    }
+
+    int changedButtons = state.lastButtonFlags ^ buttonFlags;
+    int pressedButtons = changedButtons & buttonFlags;
+    int releasedButtons = changedButtons & ~buttonFlags;
+    BOOL menuReleased = state.menuPressed && !menuPressed;
+    state.lastButtonFlags = buttonFlags;
+    state.menuPressed = menuPressed;
+
+    BOOL chromeVisible = self.view.window != nil &&
+                         self.navigationController.visibleViewController == self &&
+                         UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+    if (!chromeVisible) {
+        return;
+    }
+
+    if (menuReleased &&
+        self.presentedViewController == nil &&
+        ![_loadingFrame isShown]) {
+        [self toggleSettingsFromController];
+    }
+    if (releasedButtons & BrowserButtonB) {
+        [self accessibilityPerformEscape];
+    }
+    if (![self browserControllerInputAvailable]) {
+        return;
+    }
+
+    if (pressedButtons & BrowserButtonUp) {
+        [self moveBrowserControllerSelectionHorizontal:0 vertical:-1];
+    }
+    else if (pressedButtons & BrowserButtonDown) {
+        [self moveBrowserControllerSelectionHorizontal:0 vertical:1];
+    }
+    else if (pressedButtons & BrowserButtonLeft) {
+        [self moveBrowserControllerSelectionHorizontal:-1 vertical:0];
+    }
+    else if (pressedButtons & BrowserButtonRight) {
+        [self moveBrowserControllerSelectionHorizontal:1 vertical:0];
+    }
+
+    const float engageThreshold = 0.62f;
+    const float releaseThreshold = 0.30f;
+    if (fabsf(stickX) < releaseThreshold) {
+        state.horizontalStickLatch = 0;
+    }
+    if (fabsf(stickY) < releaseThreshold) {
+        state.verticalStickLatch = 0;
+    }
+    if (fabsf(stickX) >= fabsf(stickY) && fabsf(stickX) >= engageThreshold) {
+        NSInteger direction = stickX > 0 ? 1 : -1;
+        if (state.horizontalStickLatch != direction) {
+            state.horizontalStickLatch = direction;
+            [self moveBrowserControllerSelectionHorizontal:direction vertical:0];
+        }
+    }
+    else if (fabsf(stickY) >= engageThreshold) {
+        NSInteger direction = stickY > 0 ? -1 : 1;
+        if (state.verticalStickLatch != direction) {
+            state.verticalStickLatch = direction;
+            [self moveBrowserControllerSelectionHorizontal:0 vertical:direction];
+        }
+    }
+
+    if (releasedButtons & BrowserButtonA) {
+        [self activateBrowserControllerSelection];
+    }
+}
+
+- (void)configureBrowsingControllerCallbacks {
+    _browserControllerOwnershipActive = YES;
+    _browserControllerGeneration++;
+    if (_browserControllerStates == nil) {
+        _browserControllerStates = [[NSMutableDictionary alloc] init];
+    }
+    if (_browserControllerQueue == nil) {
+        _browserControllerQueue = dispatch_queue_create("com.moonlight.browser-controller", DISPATCH_QUEUE_SERIAL);
+    }
+
+    __weak MainFrameViewController *weakSelf = self;
+    int (^buttonFlagsForGamepad)(GCExtendedGamepad *) = ^int(GCExtendedGamepad *gamepad) {
+        int flags = 0;
+        if (gamepad.buttonA.pressed) flags |= BrowserButtonA;
+        if (gamepad.buttonB.pressed) flags |= BrowserButtonB;
+        if (gamepad.dpad.up.pressed) flags |= BrowserButtonUp;
+        if (gamepad.dpad.down.pressed) flags |= BrowserButtonDown;
+        if (gamepad.dpad.left.pressed) flags |= BrowserButtonLeft;
+        if (gamepad.dpad.right.pressed) flags |= BrowserButtonRight;
+        return flags;
+    };
+
+    void (^configureController)(GCController *) = ^(GCController *controller) {
+        MainFrameViewController *strongSelf = weakSelf;
+        GCExtendedGamepad *gamepad = controller.extendedGamepad;
+        if (strongSelf == nil || gamepad == nil) {
+            return;
+        }
+        uint64_t controllerGeneration = strongSelf->_browserControllerGeneration;
+        controller.handlerQueue = strongSelf->_browserControllerQueue;
+
+        // Chrome owns the complete controller profile. This deliberately avoids
+        // mixing raw Menu/B callbacks with UIKit focus delivery for A/D-pad/sticks.
+        gamepad.buttonMenu.pressedChangedHandler = nil;
+        gamepad.buttonB.pressedChangedHandler = nil;
+        gamepad.valueChangedHandler = nil;
+
+        if (@available(iOS 14.0, *)) {
+            for (GCControllerElement *element in controller.physicalInputProfile.allElements) {
+                element.preferredSystemGestureState = GCSystemGestureStateDisabled;
+            }
+        }
+
+        NSValue *controllerKey = [NSValue valueWithNonretainedObject:controller];
+        MoonlightBrowserControllerState *state = strongSelf->_browserControllerStates[controllerKey];
+        if (state == nil) {
+            state = [[MoonlightBrowserControllerState alloc] init];
+            strongSelf->_browserControllerStates[controllerKey] = state;
+        }
+        state.lastButtonFlags = buttonFlagsForGamepad(gamepad);
+        state.menuPressed = gamepad.buttonMenu != nil && gamepad.buttonMenu.pressed;
+        state.rawButtonFlags = state.lastButtonFlags;
+        state.rawMenuPressed = state.menuPressed;
+        float initialLeftX = gamepad.leftThumbstick.xAxis.value;
+        float initialLeftY = gamepad.leftThumbstick.yAxis.value;
+        float initialRightX = gamepad.rightThumbstick.xAxis.value;
+        float initialRightY = gamepad.rightThumbstick.yAxis.value;
+        BOOL useLeftStick = hypotf(initialLeftX, initialLeftY) >= hypotf(initialRightX, initialRightY);
+        float initialStickX = useLeftStick ? initialLeftX : initialRightX;
+        float initialStickY = useLeftStick ? initialLeftY : initialRightY;
+        state.rawHorizontalStickDirection =
+            fabsf(initialStickX) >= fabsf(initialStickY) && fabsf(initialStickX) >= 0.62f
+                ? (initialStickX > 0 ? 1 : -1) : 0;
+        state.rawVerticalStickDirection =
+            fabsf(initialStickY) > fabsf(initialStickX) && fabsf(initialStickY) >= 0.62f
+                ? (initialStickY > 0 ? 1 : -1) : 0;
+        state.horizontalStickLatch = 0;
+        state.verticalStickLatch = 0;
+        state.awaitingNeutral = state.lastButtonFlags != 0 ||
+                                state.menuPressed ||
+                                state.rawHorizontalStickDirection != 0 ||
+                                state.rawVerticalStickDirection != 0;
+
+        gamepad.valueChangedHandler = ^(GCExtendedGamepad *changedGamepad, GCControllerElement *element) {
+            int buttonFlags = buttonFlagsForGamepad(changedGamepad);
+            BOOL menuPressed = changedGamepad.buttonMenu != nil && changedGamepad.buttonMenu.pressed;
+
+            float leftX = changedGamepad.leftThumbstick.xAxis.value;
+            float leftY = changedGamepad.leftThumbstick.yAxis.value;
+            float rightX = changedGamepad.rightThumbstick.xAxis.value;
+            float rightY = changedGamepad.rightThumbstick.yAxis.value;
+            float leftMagnitude = hypotf(leftX, leftY);
+            float rightMagnitude = hypotf(rightX, rightY);
+            float stickX = leftMagnitude >= rightMagnitude ? leftX : rightX;
+            float stickY = leftMagnitude >= rightMagnitude ? leftY : rightY;
+
+            NSInteger horizontalDirection;
+            NSInteger verticalDirection;
+            BOOL inputStateChanged;
+            @synchronized(state) {
+                horizontalDirection = state.rawHorizontalStickDirection;
+                verticalDirection = state.rawVerticalStickDirection;
+
+                const float engageThreshold = 0.62f;
+                const float releaseThreshold = 0.30f;
+                if (fabsf(stickX) < releaseThreshold && fabsf(stickY) < releaseThreshold) {
+                    horizontalDirection = 0;
+                    verticalDirection = 0;
+                }
+                else if (fabsf(stickX) >= fabsf(stickY) && fabsf(stickX) >= engageThreshold) {
+                    horizontalDirection = stickX > 0 ? 1 : -1;
+                    verticalDirection = 0;
+                }
+                else if (fabsf(stickY) >= engageThreshold) {
+                    horizontalDirection = 0;
+                    verticalDirection = stickY > 0 ? 1 : -1;
+                }
+
+                inputStateChanged = state.rawButtonFlags != buttonFlags ||
+                                    state.rawMenuPressed != menuPressed ||
+                                    state.rawHorizontalStickDirection != horizontalDirection ||
+                                    state.rawVerticalStickDirection != verticalDirection;
+                state.rawButtonFlags = buttonFlags;
+                state.rawMenuPressed = menuPressed;
+                state.rawHorizontalStickDirection = horizontalDirection;
+                state.rawVerticalStickDirection = verticalDirection;
+            }
+            if (!inputStateChanged) {
+                // Ignore analog noise inside the same navigation zone.
+                return;
+            }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MainFrameViewController *currentSelf = weakSelf;
+                if (currentSelf == nil ||
+                    !currentSelf->_browserControllerOwnershipActive ||
+                    currentSelf->_browserControllerGeneration != controllerGeneration ||
+                    currentSelf->_browserControllerStates[controllerKey] != state) {
+                    return;
+                }
+                [weakSelf handleBrowserControllerSnapshotForController:changedGamepad.controller
+                                                           buttonFlags:buttonFlags
+                                                                 menu:menuPressed
+                                                               stickX:(float)horizontalDirection
+                                                               stickY:(float)verticalDirection];
+            });
+        };
+    };
+
+    for (GCController *controller in GCController.controllers) {
+        configureController(controller);
+    }
+
+    if (_browserControllerConnectObserver == nil) {
+        _browserControllerConnectObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:GCControllerDidConnectNotification
+                        object:nil
+                         queue:NSOperationQueue.mainQueue
+                    usingBlock:^(NSNotification *notification) {
+                        configureController((GCController *)notification.object);
+                    }];
+    }
+    if (_browserControllerDisconnectObserver == nil) {
+        _browserControllerDisconnectObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:GCControllerDidDisconnectNotification
+                        object:nil
+                         queue:NSOperationQueue.mainQueue
+                    usingBlock:^(NSNotification *notification) {
+                        MainFrameViewController *strongSelf = weakSelf;
+                        if (strongSelf != nil) {
+                            NSValue *controllerKey = [NSValue valueWithNonretainedObject:notification.object];
+                            [strongSelf->_browserControllerStates removeObjectForKey:controllerKey];
+                            if (strongSelf->_browserControllerStates.count == 0) {
+                                [strongSelf resetBrowserControllerSelection];
+                            }
+                        }
+                    }];
+    }
+
+    if (_browserControllerStates.count > 0 &&
+        _browserControllerIndexPath == nil &&
+        [self collectionView:self.collectionView numberOfItemsInSection:0] > 0) {
+        [self updateBrowserControllerSelectionAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:0]
+                                                 animated:NO];
+    }
+}
+
+- (void)clearBrowsingControllerCallbacks {
+    _browserControllerOwnershipActive = NO;
+    _browserControllerGeneration++;
+    if (_browserControllerConnectObserver != nil) {
+        [[NSNotificationCenter defaultCenter] removeObserver:_browserControllerConnectObserver];
+        _browserControllerConnectObserver = nil;
+    }
+    if (_browserControllerDisconnectObserver != nil) {
+        [[NSNotificationCenter defaultCenter] removeObserver:_browserControllerDisconnectObserver];
+        _browserControllerDisconnectObserver = nil;
+    }
+
+    for (GCController *controller in GCController.controllers) {
+        GCExtendedGamepad *gamepad = controller.extendedGamepad;
+        gamepad.buttonMenu.pressedChangedHandler = nil;
+        gamepad.buttonB.pressedChangedHandler = nil;
+        gamepad.valueChangedHandler = nil;
+        controller.handlerQueue = dispatch_get_main_queue();
+        if (@available(iOS 14.0, *)) {
+            for (GCControllerElement *element in controller.physicalInputProfile.allElements) {
+                element.preferredSystemGestureState = GCSystemGestureStateEnabled;
+            }
+        }
+    }
+    [_browserControllerStates removeAllObjects];
+}
+- (void)toggleSettingsFromController {
+    if (_settingsOverlayController.presentingViewController != nil) {
+        [self dismissSettingsOverlay];
+    }
+    else if (self.presentedViewController == nil && ![_loadingFrame isShown]) {
+        [self openSettingsOverlay];
+    }
+}
+
+- (BOOL)accessibilityPerformEscape {
+    if (_settingsOverlayController.presentingViewController != nil) {
+        [self dismissSettingsOverlay];
+        return YES;
+    }
+
+    UIViewController *presentedController = self.presentedViewController;
+    if ([presentedController isKindOfClass:[UIAlertController class]]) {
+        BOOL isPairingAlert = presentedController == _pairAlert;
+        [presentedController dismissViewControllerAnimated:YES completion:^{
+            if (isPairingAlert) {
+                self->_pairAlert = nil;
+                [self->_discMan startDiscovery];
+                [self hideLoadingFrame:^{
+                    [self showHostSelectionView];
+                }];
+            }
+            else {
+                [self configureBrowsingControllerCallbacks];
+            }
+        }];
+        return YES;
+    }
+    if (presentedController != nil) {
+        return YES;
+    }
+    if (!_showingHosts) {
+        [self showHostSelectionView];
+        return YES;
+    }
+    return [super accessibilityPerformEscape];
+}
+
+- (void)openSettingsOverlay {
+    if (_settingsOverlayController.presentingViewController != nil) {
+        return;
+    }
+
+    // Modal controls use UIKit's focus engine. Relinquish the raw browser
+    // profile while the sheet is visible, then reacquire it on dismissal.
+    [self clearBrowsingControllerCallbacks];
+
+    SettingsViewController *settings = [self.storyboard instantiateViewControllerWithIdentifier:@"Settings"];
+    settings.title = @"Settings";
+    settings.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
+        initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                             target:self
+                             action:@selector(dismissSettingsOverlay)];
+
+    UINavigationController *navigationController = [[UINavigationController alloc] initWithRootViewController:settings];
+    navigationController.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    navigationController.modalPresentationStyle = UIModalPresentationFormSheet;
+    navigationController.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+    navigationController.preferredContentSize = CGSizeMake(MIN(680.0, self.view.bounds.size.width - 80.0),
+                                                            MIN(760.0, self.view.bounds.size.height - 40.0));
+
+    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    [appearance configureWithOpaqueBackground];
+    appearance.backgroundColor = [UIColor colorWithRed:0.055 green:0.060 blue:0.075 alpha:1.0];
+    appearance.shadowColor = UIColor.clearColor;
+    appearance.titleTextAttributes = @{NSForegroundColorAttributeName: UIColor.whiteColor};
+    navigationController.navigationBar.standardAppearance = appearance;
+    navigationController.navigationBar.scrollEdgeAppearance = appearance;
+    navigationController.navigationBar.tintColor = [UIColor colorWithRed:0.55 green:0.48 blue:0.96 alpha:1.0];
+
+    _settingsOverlayController = navigationController;
+    navigationController.presentationController.delegate = self;
+    [self presentViewController:navigationController animated:YES completion:^{
+        UIAccessibilityPostNotification(UIAccessibilityScreenChangedNotification, settings.view);
+    }];
+}
+
+- (void)dismissSettingsOverlay {
+    SettingsViewController *settings = (SettingsViewController *)_settingsOverlayController.topViewController;
+    [settings saveSettings];
+    [self dismissViewControllerAnimated:YES completion:^{
+        self->_settingsOverlayController = nil;
+        [self configureBrowsingControllerCallbacks];
+    }];
+}
+
+- (void)presentationControllerDidDismiss:(UIPresentationController *)presentationController {
+    if (_settingsOverlayController != nil &&
+        presentationController.presentedViewController == _settingsOverlayController) {
+        SettingsViewController *settings = (SettingsViewController *)_settingsOverlayController.topViewController;
+        [settings saveSettings];
+        _settingsOverlayController = nil;
+    }
+    if (self.presentedViewController == nil &&
+        _settingsOverlayController.presentingViewController == nil &&
+        ![_loadingFrame isShown]) {
+        [self configureBrowsingControllerCallbacks];
+    }
+}
+
+- (UIModalPresentationStyle)adaptivePresentationStyleForPresentationController:(UIPresentationController *)controller {
+    return UIModalPresentationNone;
+}
+
+- (UIModalPresentationStyle)adaptivePresentationStyleForPresentationController:(UIPresentationController *)controller
+                                                               traitCollection:(UITraitCollection *)traitCollection {
+    return UIModalPresentationNone;
+}
+#endif
 
 - (void) retrieveSavedHosts {
     DataManager* dataMan = [[DataManager alloc] init];
@@ -1222,6 +2122,27 @@ static NSMutableSet* hostList;
 
 - (void)updateHosts {
     Log(LOG_I, @"Updating hosts...");
+#if !TARGET_OS_TV
+    @synchronized (hostList) {
+        _sortedHostList = [[hostList allObjects] sortedArrayUsingSelector:@selector(compareName:)];
+    }
+
+    if (_showingHosts) {
+        [self.collectionView reloadData];
+    }
+
+    for (TemporaryHost *host in _sortedHostList) {
+        for (TemporaryApp *app in host.appList) {
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+                [self updateBoxArtCacheForApp:app];
+            });
+        }
+    }
+
+    [self updateHostShortcuts];
+    [self updateTitle];
+    return;
+#else
     [[hostScrollView subviews] makeObjectsPerformSelector:@selector(removeFromSuperview)];
     UIComputerView* addComp = [[UIComputerView alloc] initForAddWithCallback:self];
     UIComputerView* compView;
@@ -1255,6 +2176,7 @@ static NSMutableSet* hostList;
     
     [hostScrollView addSubview:addComp];
     [hostScrollView setContentSize:CGSizeMake(prevEdge + addComp.frame.size.width, hostScrollView.frame.size.height)];
+#endif
 }
 
 - (float) getCompViewX:(UIComputerView*)comp addComp:(UIComputerView*)addComp prevEdge:(float)prevEdge {
@@ -1276,32 +2198,55 @@ static NSMutableSet* hostList;
 // This function forces immediate decoding of the UIImage, rather
 // than the default lazy decoding that results in janky scrolling.
 + (UIImage*) loadBoxArtForCaching:(TemporaryApp*)app {
-    UIImage* boxArt;
-    
-    NSData* imageData = [NSData dataWithContentsOfFile:[AppAssetManager boxArtPathForApp:app]];
+    NSString *boxArtPath = [AppAssetManager boxArtPathForApp:app];
+    NSData* imageData = [NSData dataWithContentsOfFile:boxArtPath];
     if (imageData == nil) {
         // No box art on disk
         return nil;
     }
     
     CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)imageData, NULL);
+    if (source == NULL) {
+        [[NSFileManager defaultManager] removeItemAtPath:boxArtPath error:nil];
+        return nil;
+    }
     CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil);
+    if (cgImage == NULL) {
+        CFRelease(source);
+        [[NSFileManager defaultManager] removeItemAtPath:boxArtPath error:nil];
+        return nil;
+    }
     
     size_t width = CGImageGetWidth(cgImage);
     size_t height = CGImageGetHeight(cgImage);
+    if (width == 0 || height == 0 || width > SIZE_MAX / 4) {
+        CGImageRelease(cgImage);
+        CFRelease(source);
+        [[NSFileManager defaultManager] removeItemAtPath:boxArtPath error:nil];
+        return nil;
+    }
     
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef imageContext =  CGBitmapContextCreate(NULL, width, height, 8, width * 4, colorSpace,
-                                                       kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-    CGColorSpaceRelease(colorSpace);
+    CGContextRef imageContext = colorSpace == NULL ? NULL :
+        CGBitmapContextCreate(NULL, width, height, 8, width * 4, colorSpace,
+                             (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    if (colorSpace != NULL) {
+        CGColorSpaceRelease(colorSpace);
+    }
+    if (imageContext == NULL) {
+        CGImageRelease(cgImage);
+        CFRelease(source);
+        return nil;
+    }
 
     CGContextDrawImage(imageContext, CGRectMake(0, 0, width, height), cgImage);
     
     CGImageRef outputImage = CGBitmapContextCreateImage(imageContext);
+    UIImage *boxArt = outputImage == NULL ? nil : [UIImage imageWithCGImage:outputImage];
 
-    boxArt = [UIImage imageWithCGImage:outputImage];
-    
-    CGImageRelease(outputImage);
+    if (outputImage != NULL) {
+        CGImageRelease(outputImage);
+    }
     CGContextRelease(imageContext);
     
     CGImageRelease(cgImage);
@@ -1339,53 +2284,143 @@ static NSMutableSet* hostList;
         _sortedAppList = visibleAppList;
     }
     
+    _showingHosts = NO;
+#if TARGET_OS_TV
     [hostScrollView removeFromSuperview];
+#else
+    [self resetBrowserControllerSelection];
+#endif
     [self.collectionView reloadData];
+#if !TARGET_OS_TV
+    if (_browserControllerStates.count > 0 && _sortedAppList.count > 0) {
+        [self updateBrowserControllerSelectionAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:0]
+                                                 animated:NO];
+    }
+#endif
 }
 
 - (UICollectionViewCell *)collectionView:(UICollectionView *)collectionView cellForItemAtIndexPath:(NSIndexPath *)indexPath {
     UICollectionViewCell* cell = [collectionView dequeueReusableCellWithReuseIdentifier:@"AppCell" forIndexPath:indexPath];
-    
-    TemporaryApp* app = _sortedAppList[indexPath.row];
-    UIAppView* appView = [[UIAppView alloc] initWithApp:app cache:_boxArtCache andCallback:self];
-    
-    if (appView.bounds.size.width > 10.0) {
-        CGFloat scale = cell.bounds.size.width / appView.bounds.size.width;
-        [appView setCenter:CGPointMake(appView.bounds.size.width / 2 * scale, appView.bounds.size.height / 2 * scale)];
-        appView.transform = CGAffineTransformMakeScale(scale, scale);
+
+    for (UIView *subview in cell.contentView.subviews) {
+        [subview removeFromSuperview];
     }
-    
-    [cell.subviews.firstObject removeFromSuperview]; // Remove a view that was previously added
-    [cell addSubview:appView];
-    
-    // Shadow opacity is controlled inside UIAppView based on whether the app
-    // is hidden or not during the update cycle.
-    UIBezierPath *shadowPath = [UIBezierPath bezierPathWithRect:cell.bounds];
+
+    UIControl *contentView;
+    if (_showingHosts) {
+        if (indexPath.item < _sortedHostList.count) {
+            TemporaryHost *host = _sortedHostList[indexPath.item];
+            contentView = [[UIComputerView alloc] initWithComputer:host andCallback:self];
+        } else {
+            contentView = [[UIComputerView alloc] initForAddWithCallback:self];
+        }
+    } else {
+        TemporaryApp *app = _sortedAppList[indexPath.item];
+        contentView = [[UIAppView alloc] initWithApp:app cache:_boxArtCache andCallback:self];
+    }
+
+#if TARGET_OS_TV
+    CGFloat scale = cell.contentView.bounds.size.width / contentView.bounds.size.width;
+    contentView.center = CGPointMake(CGRectGetMidX(cell.contentView.bounds), CGRectGetMidY(cell.contentView.bounds));
+    contentView.transform = CGAffineTransformMakeScale(scale, scale);
+    cell.contentView.layer.shadowColor = UIColor.blackColor.CGColor;
+    cell.contentView.layer.shadowOffset = CGSizeMake(1.0, 5.0);
+    cell.contentView.layer.shadowPath = [UIBezierPath bezierPathWithRect:cell.contentView.bounds].CGPath;
+#else
+    contentView.frame = cell.contentView.bounds;
+    contentView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+#endif
+    [cell.contentView addSubview:contentView];
+
+    cell.backgroundColor = UIColor.clearColor;
+    cell.contentView.backgroundColor = UIColor.clearColor;
+    cell.contentView.clipsToBounds = NO;
     cell.layer.masksToBounds = NO;
-    cell.layer.shadowColor = [UIColor blackColor].CGColor;
-    cell.layer.shadowOffset = CGSizeMake(1.0f, 5.0f);
-    cell.layer.shadowPath = shadowPath.CGPath;
-    
-#if !TARGET_OS_TV
-    cell.layer.borderWidth = 1;
-    cell.layer.borderColor = [[UIColor colorWithRed:0 green:0 blue:0 alpha:0.3f] CGColor];
     cell.exclusiveTouch = YES;
+
+#if !TARGET_OS_TV
+    BOOL controllerHighlighted = [_browserControllerIndexPath isEqual:indexPath];
+    if ([contentView isKindOfClass:[UIAppView class]]) {
+        [(UIAppView *)contentView setControllerHighlighted:controllerHighlighted];
+    }
+    else if ([contentView isKindOfClass:[UIComputerView class]]) {
+        [(UIComputerView *)contentView setControllerHighlighted:controllerHighlighted];
+    }
 #endif
 
     return cell;
 }
+
+#if !TARGET_OS_TV
+- (void)collectionView:(UICollectionView *)collectionView
+       willDisplayCell:(UICollectionViewCell *)cell
+    forItemAtIndexPath:(NSIndexPath *)indexPath {
+    UIControl *control = (UIControl *)cell.contentView.subviews.firstObject;
+    BOOL controllerHighlighted = [_browserControllerIndexPath isEqual:indexPath];
+    if ([control isKindOfClass:[UIAppView class]]) {
+        [(UIAppView *)control setControllerHighlighted:controllerHighlighted];
+    }
+    else if ([control isKindOfClass:[UIComputerView class]]) {
+        [(UIComputerView *)control setControllerHighlighted:controllerHighlighted];
+    }
+}
+#endif
 
 - (NSInteger)numberOfSectionsInCollectionView:(UICollectionView *)collectionView {
     return 1; // App collection only
 }
 
 - (NSInteger)collectionView:(UICollectionView *)collectionView numberOfItemsInSection:(NSInteger)section {
-    if (_selectedHost != nil && _sortedAppList != nil) {
+    if (_showingHosts) {
+#if TARGET_OS_TV
+        // tvOS retains the established focus-driven horizontal host browser.
+        return 0;
+#else
+        return _sortedHostList.count + 1;
+#endif
+    }
+    else if (_selectedHost != nil && _sortedAppList != nil) {
         return _sortedAppList.count;
     }
     else {
         return 0;
     }
+}
+
+- (CGSize)collectionView:(UICollectionView *)collectionView
+                   layout:(UICollectionViewLayout *)collectionViewLayout
+   sizeForItemAtIndexPath:(NSIndexPath *)indexPath {
+#if TARGET_OS_TV
+    return ((UICollectionViewFlowLayout *)collectionViewLayout).itemSize;
+#else
+    UIEdgeInsets safeArea = self.view.safeAreaInsets;
+    CGFloat leadingInset = MAX(24.0, safeArea.left + 12.0);
+    CGFloat trailingInset = MAX(24.0, safeArea.right + 12.0);
+    CGFloat availableWidth = MAX(1.0, collectionView.bounds.size.width - leadingInset - trailingInset);
+    BOOL isPad = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad;
+    CGFloat desiredWidth = _showingHosts ? (isPad ? 210.0 : 176.0) : (isPad ? 160.0 : 132.0);
+    CGFloat minimumWidth = _showingHosts ? (isPad ? 180.0 : 150.0) : (isPad ? 138.0 : 112.0);
+    NSInteger columns = MAX(1, (NSInteger)floor((availableWidth + 16.0) / (desiredWidth + 16.0)));
+    CGFloat width = floor((availableWidth - (columns - 1) * 16.0) / columns);
+    width = MIN(desiredWidth, MAX(MIN(minimumWidth, availableWidth), width));
+    BOOL accessibilityText = UIContentSizeCategoryIsAccessibilityCategory(self.traitCollection.preferredContentSizeCategory);
+    CGFloat hostHeight = (isPad ? 180.0 : 156.0) + (accessibilityText ? 40.0 : 0.0);
+    return _showingHosts ? CGSizeMake(width, hostHeight) : CGSizeMake(width, width * 1.40);
+#endif
+}
+
+- (UIEdgeInsets)collectionView:(UICollectionView *)collectionView
+                        layout:(UICollectionViewLayout *)collectionViewLayout
+        insetForSectionAtIndex:(NSInteger)section {
+#if TARGET_OS_TV
+    return ((UICollectionViewFlowLayout *)collectionViewLayout).sectionInset;
+#else
+    UIEdgeInsets safeArea = self.view.safeAreaInsets;
+    return UIEdgeInsetsMake(24.0,
+                            MAX(24.0, safeArea.left + 12.0),
+                            MAX(28.0, safeArea.bottom + 16.0),
+                            MAX(24.0, safeArea.right + 12.0));
+#endif
 }
 
 - (void)didReceiveMemoryWarning
@@ -1396,6 +2431,13 @@ static NSMutableSet* hostList;
     [_boxArtCache removeAllObjects];
 }
 
+- (void)dealloc {
+#if !TARGET_OS_TV
+    [self clearBrowsingControllerCallbacks];
+#endif
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
     [self.view endEditing:YES];
 }
@@ -1404,12 +2446,6 @@ static NSMutableSet* hostList;
     [textField resignFirstResponder];
     return YES;
 }
-
-#if !TARGET_OS_TV
-- (BOOL)shouldAutorotate {
-    return YES;
-}
-#endif
 
 - (void) disableNavigation {
     self.navigationController.navigationBar.topItem.rightBarButtonItem.enabled = NO;
@@ -1422,19 +2458,19 @@ static NSMutableSet* hostList;
 }
 
 #if TARGET_OS_TV
+- (void)configureBrowsingControllerCallbacks {
+}
+
+- (void)clearBrowsingControllerCallbacks {
+}
+
 - (BOOL)canBecomeFocused {
     return YES;
 }
 #endif
 
 - (void)didUpdateFocusInContext:(UIFocusUpdateContext *)context withAnimationCoordinator:(UIFocusAnimationCoordinator *)coordinator {
-    
-#if !TARGET_OS_TV
-    if (context.nextFocusedView != nil) {
-        [context.nextFocusedView setAlpha:0.8];
-    }
-    [context.previouslyFocusedView setAlpha:1.0];
-#endif
+    [super didUpdateFocusInContext:context withAnimationCoordinator:coordinator];
 }
 
 @end

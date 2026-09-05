@@ -14,8 +14,39 @@
 #import "RelativeTouchHandler.h"
 #import "AbsoluteTouchHandler.h"
 #import "KeyboardInputField.h"
+#import <objc/runtime.h>
+#include <stdatomic.h>
 
 static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
+
+static char KeyboardButtonKeyCodeAssociation;
+static char KeyboardButtonToggleAssociation;
+
+#if !TARGET_OS_TV
+@interface MoonlightKeyboardAccessoryScrollView : UIScrollView
+@property (nonatomic, weak) UIView *centeredContentView;
+@end
+
+@implementation MoonlightKeyboardAccessoryScrollView
+- (void)layoutSubviews {
+    [super layoutSubviews];
+
+    CGFloat contentWidth = CGRectGetWidth(self.centeredContentView.bounds) + 16.0;
+    CGFloat centeringInset = MAX(0.0, (CGRectGetWidth(self.bounds) - contentWidth) * 0.5);
+    self.contentInset = UIEdgeInsetsMake(0, centeringInset, 0, centeringInset);
+    self.alwaysBounceHorizontal = contentWidth > CGRectGetWidth(self.bounds);
+}
+@end
+#endif
+
+@interface StreamView ()
+- (void)activateHardwareInput;
+#if !TARGET_OS_TV
+- (void)dismissKeyboard;
+- (void)releaseAccessoryKeys;
+- (void)resetAccessoryKeyState;
+#endif
+@end
 
 @implementation StreamView {
     OnScreenControls* onScreenControls;
@@ -23,6 +54,14 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
     KeyboardInputField* keyInputField;
     BOOL isInputingText;
     NSMutableSet* keysDown;
+    uint64_t keyboardSessionToken;
+    BOOL keyboardSessionInvalidated;
+    _Atomic(bool) inputSuspended;
+#if !TARGET_OS_TV
+    UITapGestureRecognizer* keyboardToggleGestureRecognizer;
+    UIView* keyboardAccessoryView;
+    NSArray<UIButton *> *keyboardAccessoryButtons;
+#endif
     
     float streamAspectRatio;
     
@@ -37,9 +76,9 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
     double accumulatedMouseDeltaX;
     double accumulatedMouseDeltaY;
     
-    UIResponder* touchHandler;
+    UIResponder<MoonlightTouchHandler>* touchHandler;
     
-    id<UserInteractionDelegate> interactionDelegate;
+    __weak id<UserInteractionDelegate> interactionDelegate;
     NSTimer* interactionTimer;
     BOOL hasUserInteracted;
     
@@ -49,18 +88,63 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 - (void) setupStreamView:(ControllerSupport*)controllerSupport
      interactionDelegate:(id<UserInteractionDelegate>)interactionDelegate
                   config:(StreamConfiguration*)streamConfig {
+    atomic_init(&inputSuspended, false);
     self->interactionDelegate = interactionDelegate;
     self->streamAspectRatio = (float)streamConfig.width / (float)streamConfig.height;
     
     TemporarySettings* settings = [[[DataManager alloc] init] getSettings];
     
-    keysDown = [[NSMutableSet alloc] init];
-    keyInputField = [[KeyboardInputField alloc] initWithFrame:CGRectZero];
-    [keyInputField setKeyboardType:UIKeyboardTypeDefault];
-    [keyInputField setAutocorrectionType:UITextAutocorrectionTypeNo];
-    [keyInputField setAutocapitalizationType:UITextAutocapitalizationTypeNone];
-    [keyInputField setSpellCheckingType:UITextSpellCheckingTypeNo];
-    [self addSubview:keyInputField];
+    if (keysDown == nil) {
+        keysDown = [[NSMutableSet alloc] init];
+    }
+    if (keyboardSessionToken == 0) {
+        keyboardSessionToken = [KeyboardSupport beginKeyboardSession];
+    }
+    MoonlightSetMouseInputSuspended(NO);
+    if (keyInputField == nil) {
+        keyInputField = [[KeyboardInputField alloc] initWithFrame:CGRectZero];
+        keyInputField.delegate = self;
+        keyInputField.text = @"0";
+        keyInputField.keyboardType = UIKeyboardTypeDefault;
+#if !TARGET_OS_TV
+        keyInputField.keyboardAppearance = UIKeyboardAppearanceDark;
+#endif
+        keyInputField.autocorrectionType = UITextAutocorrectionTypeNo;
+        keyInputField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        keyInputField.spellCheckingType = UITextSpellCheckingTypeNo;
+        keyInputField.backgroundColor = UIColor.clearColor;
+        keyInputField.textColor = UIColor.clearColor;
+        keyInputField.tintColor = UIColor.clearColor;
+        keyInputField.accessibilityElementsHidden = YES;
+        keyInputField.isAccessibilityElement = NO;
+        [keyInputField addTarget:self
+                          action:@selector(onKeyboardPressed:)
+                forControlEvents:UIControlEventEditingChanged];
+#if !TARGET_OS_TV
+        keyboardAccessoryView = [self createKeyboardAccessoryView];
+        keyInputField.inputAccessoryView = keyboardAccessoryView;
+#endif
+        [self addSubview:keyInputField];
+    }
+
+#if !TARGET_OS_TV
+    if (keyboardToggleGestureRecognizer == nil) {
+        keyboardToggleGestureRecognizer = [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                                   action:@selector(keyboardToggleGestureRecognized:)];
+        keyboardToggleGestureRecognizer.numberOfTapsRequired = 1;
+        keyboardToggleGestureRecognizer.numberOfTouchesRequired = 3;
+        keyboardToggleGestureRecognizer.cancelsTouchesInView = YES;
+        keyboardToggleGestureRecognizer.delegate = self;
+        [self addGestureRecognizer:keyboardToggleGestureRecognizer];
+    }
+    self.isAccessibilityElement = YES;
+    self.accessibilityLabel = @"Remote desktop";
+    self.accessibilityHint = @"Three-finger tap opens the remote keyboard";
+    self.accessibilityCustomActions = @[[[UIAccessibilityCustomAction alloc]
+        initWithName:@"Toggle remote keyboard"
+              target:self
+            selector:@selector(accessibilityToggleKeyboard)]];
+#endif
     
 #if TARGET_OS_TV
     // tvOS requires RelativeTouchHandler to manage Apple Remote input
@@ -94,6 +178,15 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
     // events if a GCMouse is connected.
     if (@available(iOS 13.4, *)) {
         [self addInteraction:[[UIPointerInteraction alloc] initWithDelegate:self]];
+
+        // Magic Keyboard and many keyboard-case trackpads are delivered through
+        // UIKit rather than GCMouse. Pointer-region callbacks are not guaranteed
+        // for every movement, so use a hover recognizer as the continuous path.
+        UIHoverGestureRecognizer *pointerHoverRecognizer =
+            [[UIHoverGestureRecognizer alloc] initWithTarget:self action:@selector(mouseHovered:)];
+        pointerHoverRecognizer.allowedTouchTypes = @[@(UITouchTypeIndirectPointer)];
+        pointerHoverRecognizer.cancelsTouchesInView = NO;
+        [self addGestureRecognizer:pointerHoverRecognizer];
         
         UIPanGestureRecognizer *discreteMouseWheelRecognizer = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(mouseWheelMovedDiscrete:)];
         discreteMouseWheelRecognizer.maximumNumberOfTouches = 0;
@@ -126,7 +219,80 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
     
     // This is critical to ensure keyboard events are delivered to this
     // StreamView and not our parent UIView, especially on tvOS.
+    [self activateHardwareInput];
+}
+
+- (void)activateHardwareInput {
+    if (self.window == nil ||
+        keyboardSessionInvalidated ||
+        atomic_load(&inputSuspended) ||
+        keyInputField.isFirstResponder ||
+        UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
+        return;
+    }
     [self becomeFirstResponder];
+}
+
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    if (self.window != nil) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self activateHardwareInput];
+        });
+    }
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+
+#if !TARGET_OS_TV
+    if (onScreenControls != nil) {
+        [onScreenControls updateLayoutForBounds:self.bounds safeAreaInsets:self.safeAreaInsets];
+    }
+#endif
+}
+
+- (void)prepareForInactivity {
+    atomic_store(&inputSuspended, true);
+    MoonlightSetMouseInputSuspended(YES);
+    [touchHandler cancelAllTouches];
+    MoonlightReleaseMouseButtons(MoonlightMouseButtonSourceAbsoluteTouch);
+    MoonlightReleaseMouseButtons(MoonlightMouseButtonSourceRelativeTouch);
+    MoonlightReleaseMouseButtons(MoonlightMouseButtonSourceUIKitMouse);
+    MoonlightReleaseMouseButtons(MoonlightMouseButtonSourceX1Mouse);
+    if (keyboardSessionToken != 0) {
+        [KeyboardSupport endKeyboardSession:keyboardSessionToken];
+        keyboardSessionToken = 0;
+    }
+#if !TARGET_OS_TV
+    isInputingText = NO;
+    [self resetAccessoryKeyState];
+    [keyInputField resignFirstResponder];
+    [self resignFirstResponder];
+#endif
+}
+
+- (void)resumeAfterInactivity {
+    if (keyboardSessionInvalidated) {
+        return;
+    }
+    atomic_store(&inputSuspended, false);
+    MoonlightSetMouseInputSuspended(NO);
+    if (keyboardSessionToken == 0) {
+        keyboardSessionToken = [KeyboardSupport beginKeyboardSession];
+    }
+    [self activateHardwareInput];
+}
+
+- (void)invalidateKeyboardSession {
+    keyboardSessionInvalidated = YES;
+    [self prepareForInactivity];
+}
+
+- (void)dealloc {
+    if (keyboardSessionToken != 0) {
+        [KeyboardSupport endKeyboardSession:keyboardSessionToken];
+    }
 }
 
 - (void)startInteractionTimer {
@@ -241,6 +407,9 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 }
 
 - (BOOL)sendStylusEvent:(UITouch*)event {
+    if (atomic_load_explicit(&inputSuspended, memory_order_acquire)) {
+        return YES;
+    }
     uint8_t type;
     
     // Don't touch stylus events if the host doesn't support them. We want to pass
@@ -277,6 +446,9 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 }
 
 - (void)sendStylusHoverEvent:(UIHoverGestureRecognizer*)gesture API_AVAILABLE(ios(13.0)) {
+    if (atomic_load_explicit(&inputSuspended, memory_order_acquire)) {
+        return;
+    }
     uint8_t type;
     
     switch (gesture.state) {
@@ -319,6 +491,9 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 #endif
 
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
+    if (atomic_load_explicit(&inputSuspended, memory_order_acquire)) {
+        return;
+    }
     if ([self handleMouseButtonEvent:BUTTON_ACTION_PRESS
                           forTouches:touches
                            withEvent:event]) {
@@ -344,121 +519,301 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 #endif
     
     if (![onScreenControls handleTouchDownEvent:touches]) {
-        // We still inform the touch handler even if we're going trigger the
-        // keyboard activation gesture. This is important to ensure the touch
-        // handler has a consistent view of touch events to correctly suppress
-        // activation of one or two finger gestures when a three finger gesture
-        // is triggered.
+        // The three-finger keyboard gesture is handled by a tap recognizer. We
+        // still forward the touches so the active touch handler gets a complete
+        // begin/cancel sequence when that recognizer succeeds.
         [touchHandler touchesBegan:touches withEvent:event];
-        
-        if ([[event allTouches] count] == 3) {
-            if (isInputingText) {
-                Log(LOG_D, @"Closing the keyboard");
-                [keyInputField resignFirstResponder];
-                isInputingText = false;
-            } else {
-                Log(LOG_D, @"Opening the keyboard");
-                // Prepare the textbox used to capture keyboard events.
-                keyInputField.delegate = self;
-                keyInputField.text = @"0";
+    }
+}
+
 #if !TARGET_OS_TV
-                // Prepare the toolbar above the keyboard for more options
-                UIToolbar *customToolbarView = [[UIToolbar alloc] initWithFrame:CGRectMake(0, 0, self.bounds.size.width, 44)];
-                
-                UIBarButtonItem *doneBarButton = [self createButtonWithImageNamed:@"DoneIcon.png" backgroundColor:[UIColor clearColor] target:self action:@selector(toolbarButtonClicked:) keyCode:0x00 isToggleable:NO];
-                UIBarButtonItem *windowsBarButton = [self createButtonWithImageNamed:@"WindowsIcon.png" backgroundColor:[UIColor blackColor] target:self action:@selector(toolbarButtonClicked:) keyCode:0x5B isToggleable:YES];
-                UIBarButtonItem *tabBarButton = [self createButtonWithImageNamed:@"TabIcon.png" backgroundColor:[UIColor blackColor] target:self action:@selector(toolbarButtonClicked:) keyCode:0x09 isToggleable:NO];
-                UIBarButtonItem *shiftBarButton = [self createButtonWithImageNamed:@"ShiftIcon.png" backgroundColor:[UIColor blackColor] target:self action:@selector(toolbarButtonClicked:) keyCode:0xA0 isToggleable:YES];
-                UIBarButtonItem *escapeBarButton = [self createButtonWithImageNamed:@"EscapeIcon.png" backgroundColor:[UIColor blackColor] target:self action:@selector(toolbarButtonClicked:) keyCode:0x1B isToggleable:NO];
-                UIBarButtonItem *controlBarButton = [self createButtonWithImageNamed:@"ControlIcon.png" backgroundColor:[UIColor blackColor] target:self action:@selector(toolbarButtonClicked:) keyCode:0xA2 isToggleable:YES];
-                UIBarButtonItem *altBarButton = [self createButtonWithImageNamed:@"AltIcon.png" backgroundColor:[UIColor blackColor] target:self action:@selector(toolbarButtonClicked:) keyCode:0xA4 isToggleable:YES];
-                UIBarButtonItem *deleteBarButton = [self createButtonWithImageNamed:@"DeleteIcon.png" backgroundColor:[UIColor blackColor] target:self action:@selector(toolbarButtonClicked:) keyCode:0x2E isToggleable:NO];
-                UIBarButtonItem *flexibleSpace = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
-                
-                [customToolbarView setItems:[NSArray arrayWithObjects:doneBarButton, windowsBarButton, escapeBarButton, tabBarButton, shiftBarButton, controlBarButton, altBarButton, deleteBarButton, flexibleSpace, nil]];
-                keyInputField.inputAccessoryView = customToolbarView;
-#endif
-                [keyInputField becomeFirstResponder];
-                [keyInputField addTarget:self action:@selector(onKeyboardPressed:) forControlEvents:UIControlEventEditingChanged];
-                
-                // Undo causes issues for our state management, so turn it off
-                [keyInputField.undoManager disableUndoRegistration];
-                
-                isInputingText = true;
-            }
+- (UIView *)createKeyboardAccessoryView {
+    UIVisualEffectView *accessory = [[UIVisualEffectView alloc]
+        initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark]];
+    accessory.frame = CGRectMake(0, 0, self.bounds.size.width, 60.0);
+    accessory.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+
+    UIView *topSeparator = [[UIView alloc] initWithFrame:CGRectZero];
+    topSeparator.translatesAutoresizingMaskIntoConstraints = NO;
+    topSeparator.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+    [accessory.contentView addSubview:topSeparator];
+
+    MoonlightKeyboardAccessoryScrollView *scrollView = [[MoonlightKeyboardAccessoryScrollView alloc] initWithFrame:CGRectZero];
+    scrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    scrollView.showsHorizontalScrollIndicator = NO;
+    scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    [accessory.contentView addSubview:scrollView];
+
+    UIStackView *buttonStack = [[UIStackView alloc] initWithFrame:CGRectZero];
+    buttonStack.translatesAutoresizingMaskIntoConstraints = NO;
+    buttonStack.axis = UILayoutConstraintAxisHorizontal;
+    buttonStack.alignment = UIStackViewAlignmentCenter;
+    buttonStack.distribution = UIStackViewDistributionFill;
+    buttonStack.spacing = 8.0;
+    [scrollView addSubview:buttonStack];
+    scrollView.centeredContentView = buttonStack;
+
+    NSArray<NSDictionary<NSString *, id> *> *buttonDescriptions = @[
+        @{@"label": @"Dismiss keyboard", @"symbol": @"keyboard.chevron.compact.down", @"keyCode": @0x00, @"toggle": @NO},
+        @{@"label": @"Esc", @"keyCode": @0x1B, @"toggle": @NO},
+        @{@"label": @"Super", @"keyCode": @0x5B, @"toggle": @YES},
+        @{@"label": @"Tab", @"keyCode": @0x09, @"toggle": @NO},
+        @{@"label": @"Shift", @"keyCode": @0xA0, @"toggle": @YES},
+        @{@"label": @"Ctrl", @"keyCode": @0xA2, @"toggle": @YES},
+        @{@"label": @"Alt", @"keyCode": @0xA4, @"toggle": @YES},
+        @{@"label": @"Del", @"keyCode": @0x2E, @"toggle": @NO},
+    ];
+
+    NSMutableArray<UIButton *> *buttons = [NSMutableArray arrayWithCapacity:buttonDescriptions.count];
+    [buttonDescriptions enumerateObjectsUsingBlock:^(NSDictionary<NSString *, id> *description,
+                                                      NSUInteger index,
+                                                      BOOL *stop) {
+        UIButton *button = [self createKeyboardAccessoryButtonWithLabel:description[@"label"]
+                                                              symbolName:description[@"symbol"]
+                                                                 keyCode:[description[@"keyCode"] unsignedShortValue]
+                                                            isToggleable:[description[@"toggle"] boolValue]];
+        [buttons addObject:button];
+        [buttonStack addArrangedSubview:button];
+
+        // Separate utility, navigation, and modifier keys without adding more
+        // text or visual weight to this compact accessory.
+        if (index == 0 || index == 3) {
+            UIView *separator = [[UIView alloc] initWithFrame:CGRectZero];
+            separator.translatesAutoresizingMaskIntoConstraints = NO;
+            separator.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.13];
+            separator.layer.cornerRadius = 0.5;
+            [separator.widthAnchor constraintEqualToConstant:1.0].active = YES;
+            [separator.heightAnchor constraintEqualToConstant:26.0].active = YES;
+            [buttonStack addArrangedSubview:separator];
         }
-    }
+    }];
+    keyboardAccessoryButtons = [buttons copy];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [topSeparator.leadingAnchor constraintEqualToAnchor:accessory.contentView.leadingAnchor],
+        [topSeparator.trailingAnchor constraintEqualToAnchor:accessory.contentView.trailingAnchor],
+        [topSeparator.topAnchor constraintEqualToAnchor:accessory.contentView.topAnchor],
+        [topSeparator.heightAnchor constraintEqualToConstant:0.5],
+        [scrollView.leadingAnchor constraintEqualToAnchor:accessory.contentView.safeAreaLayoutGuide.leadingAnchor],
+        [scrollView.trailingAnchor constraintEqualToAnchor:accessory.contentView.safeAreaLayoutGuide.trailingAnchor],
+        [scrollView.topAnchor constraintEqualToAnchor:accessory.contentView.topAnchor constant:4.0],
+        [scrollView.bottomAnchor constraintEqualToAnchor:accessory.contentView.bottomAnchor constant:-4.0],
+        [buttonStack.leadingAnchor constraintEqualToAnchor:scrollView.contentLayoutGuide.leadingAnchor constant:12.0],
+        [buttonStack.trailingAnchor constraintEqualToAnchor:scrollView.contentLayoutGuide.trailingAnchor constant:-12.0],
+        [buttonStack.centerYAnchor constraintEqualToAnchor:scrollView.frameLayoutGuide.centerYAnchor],
+        [buttonStack.heightAnchor constraintEqualToConstant:42.0],
+    ]];
+
+    return accessory;
 }
 
-- (UIBarButtonItem *)createButtonWithImageNamed:(NSString *)imageName backgroundColor:(UIColor *)backgroundColor target:(id)target action:(SEL)action keyCode:(NSInteger)keyCode isToggleable:(BOOL)isToggleable {
-    UIImage *image = [UIImage imageNamed:imageName];
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
-    [button setImage:image forState:UIControlStateNormal];
-    button.frame = CGRectMake(0, 0, 30, 30);
-    button.imageView.contentMode = UIViewContentModeScaleAspectFit;
-    button.imageView.backgroundColor = backgroundColor;
-    button.imageView.layer.cornerRadius = 10.0;
-    button.imageEdgeInsets = UIEdgeInsetsMake(6, 6, 6, 6);
-    [button addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
-    objc_setAssociatedObject(button, "keyCode", @(keyCode), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(button, "isToggleable", @(isToggleable), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(button, "isOn", @(NO), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    UIBarButtonItem *barButton = [[UIBarButtonItem alloc] initWithCustomView:button];
-    return barButton;
-}
+- (UIButton *)createKeyboardAccessoryButtonWithLabel:(NSString *)label
+                                           symbolName:(NSString *)symbolName
+                                              keyCode:(u_short)keyCode
+                                         isToggleable:(BOOL)isToggleable {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    button.accessibilityLabel = label;
+    button.accessibilityIdentifier = [NSString stringWithFormat:@"stream.keyboard.%@", label.lowercaseString];
+    button.accessibilityHint = isToggleable ? @"Double tap to toggle this remote modifier" : @"Double tap to send this key to the remote computer";
 
-- (void)toolbarButtonClicked:(UIButton *)sender {
-    BOOL isToggleable = [objc_getAssociatedObject(sender, "isToggleable") boolValue];
-    BOOL isOn = [objc_getAssociatedObject(sender, "isOn") boolValue];
-    if (isToggleable){
-        isOn = !isOn;
-        // Update the button's appearance based on its new state
-        if (isOn) {
-            sender.imageView.backgroundColor = [UIColor lightGrayColor];
-        } else {
-            sender.imageView.backgroundColor = [UIColor blackColor];
-        }
-    }
-    // Update the new on/off state of the button
-    objc_setAssociatedObject(sender, "isOn", @(isOn), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    // Get the keyCode parameter and convert to short for key press event
-    short keyCode = [objc_getAssociatedObject(sender, "keyCode") shortValue];
-    // Close keyboard if done button clicked
-    if (!keyCode) {
-        [keyInputField resignFirstResponder];
-        isInputingText = false;
-    }
-    else {
-        // Send key press event using keyCode parameter, toggle if necessary
-        if (isToggleable){
-            if (isOn){
-                LiSendKeyboardEvent(keyCode, KEY_ACTION_DOWN, 0);
-                [keysDown addObject:@(keyCode)];
-            } else {
-                LiSendKeyboardEvent(keyCode, KEY_ACTION_UP, 0);
-                [keysDown removeObject:@(keyCode)];
+    if (@available(iOS 15.0, *)) {
+        UIButtonConfiguration *configuration = [UIButtonConfiguration filledButtonConfiguration];
+        configuration.cornerStyle = UIButtonConfigurationCornerStyleMedium;
+        configuration.contentInsets = NSDirectionalEdgeInsetsMake(5, 12, 5, 12);
+        configuration.baseForegroundColor = UIColor.whiteColor;
+        configuration.baseBackgroundColor = [UIColor colorWithRed:0.17 green:0.18 blue:0.22 alpha:0.96];
+        configuration.background.strokeWidth = 1.0;
+        configuration.background.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+        configuration.preferredSymbolConfigurationForImage =
+            [UIImageSymbolConfiguration configurationWithPointSize:17.0 weight:UIImageSymbolWeightSemibold];
+        configuration.titleTextAttributesTransformer = ^NSDictionary<NSAttributedStringKey, id> *
+            (NSDictionary<NSAttributedStringKey, id> *incomingAttributes) {
+                NSMutableDictionary<NSAttributedStringKey, id> *attributes = [incomingAttributes mutableCopy];
+                attributes[NSFontAttributeName] = [UIFont systemFontOfSize:14.0 weight:UIFontWeightSemibold];
+                return attributes;
+            };
+        if (symbolName != nil) {
+            configuration.image = [UIImage systemImageNamed:symbolName];
+            if (configuration.image == nil) {
+                configuration.image = [UIImage systemImageNamed:@"chevron.down"];
             }
         }
         else {
-            LiSendKeyboardEvent(keyCode, KEY_ACTION_DOWN, 0);
-            usleep(50 * 1000);
-            LiSendKeyboardEvent(keyCode, KEY_ACTION_UP, 0);
+            configuration.title = label;
         }
+        button.configuration = configuration;
+
+        button.configurationUpdateHandler = ^(UIButton *updatedButton) {
+            UIButtonConfiguration *updatedConfiguration = updatedButton.configuration;
+            updatedConfiguration.baseForegroundColor = UIColor.whiteColor;
+            UIColor *accentColor = [UIColor colorWithRed:0.55 green:0.48 blue:0.96 alpha:1.0];
+            if (updatedButton.selected) {
+                updatedConfiguration.baseBackgroundColor = [accentColor colorWithAlphaComponent:0.72];
+                updatedConfiguration.background.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.28];
+            }
+            else if (updatedButton.highlighted) {
+                updatedConfiguration.baseBackgroundColor = [UIColor colorWithRed:0.25 green:0.26 blue:0.31 alpha:0.98];
+                updatedConfiguration.background.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.20];
+            }
+            else {
+                updatedConfiguration.baseBackgroundColor = [UIColor colorWithRed:0.17 green:0.18 blue:0.22 alpha:0.96];
+                updatedConfiguration.background.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+            }
+            updatedButton.configuration = updatedConfiguration;
+        };
+    }
+    else {
+        UIImage *image = nil;
+        if (symbolName != nil) {
+            if (@available(iOS 13.0, *)) {
+                image = [UIImage systemImageNamed:symbolName];
+            }
+        }
+        if (image != nil) {
+            [button setImage:image forState:UIControlStateNormal];
+        }
+        else {
+            [button setTitle:symbolName != nil ? @"Done" : label forState:UIControlStateNormal];
+        }
+        button.layer.cornerRadius = 10.0;
+        button.layer.cornerCurve = kCACornerCurveContinuous;
+        button.layer.borderWidth = 1.0;
+        button.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.12].CGColor;
+    }
+
+    button.titleLabel.numberOfLines = 1;
+    button.titleLabel.adjustsFontSizeToFitWidth = YES;
+    button.titleLabel.minimumScaleFactor = 0.85;
+
+    [button addTarget:self action:@selector(toolbarButtonClicked:) forControlEvents:UIControlEventTouchUpInside];
+    objc_setAssociatedObject(button, &KeyboardButtonKeyCodeAssociation, @(keyCode), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(button, &KeyboardButtonToggleAssociation, @(isToggleable), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    [button.heightAnchor constraintEqualToConstant:42.0].active = YES;
+    UIFont *titleFont = [UIFont systemFontOfSize:14.0 weight:UIFontWeightSemibold];
+    CGFloat titleWidth = ceil([label sizeWithAttributes:@{NSFontAttributeName: titleFont}].width);
+    CGFloat buttonWidth = symbolName != nil ? 48.0 : MAX(56.0, titleWidth + 24.0);
+    [button.widthAnchor constraintEqualToConstant:buttonWidth].active = YES;
+    [self updateKeyboardAccessoryButtonState:button];
+    return button;
+}
+
+- (void)updateKeyboardAccessoryButtonState:(UIButton *)button {
+    BOOL isToggleable = [objc_getAssociatedObject(button, &KeyboardButtonToggleAssociation) boolValue];
+    button.accessibilityValue = isToggleable ? (button.selected ? @"On" : @"Off") : nil;
+    if (button.selected) {
+        button.accessibilityTraits |= UIAccessibilityTraitSelected;
+    }
+    else {
+        button.accessibilityTraits &= ~UIAccessibilityTraitSelected;
+    }
+    if (@available(iOS 15.0, *)) {
+        [button setNeedsUpdateConfiguration];
+    }
+    else {
+        button.backgroundColor = button.selected
+            ? [button.tintColor colorWithAlphaComponent:0.18]
+            : UIColor.clearColor;
     }
 }
+
+- (void)keyboardToggleGestureRecognized:(UITapGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateRecognized) {
+        return;
+    }
+
+    [self toggleKeyboard];
+}
+
+- (BOOL)accessibilityToggleKeyboard {
+    [self toggleKeyboard];
+    return YES;
+}
+
+- (void)toggleKeyboard {
+
+    if (isInputingText || keyInputField.isFirstResponder) {
+        Log(LOG_D, @"Closing the keyboard");
+        [self dismissKeyboard];
+    }
+    else {
+        Log(LOG_D, @"Opening the keyboard");
+        [self showKeyboard];
+    }
+}
+
+- (void)showKeyboard {
+    [self resumeAfterInactivity];
+    keyInputField.text = @"0";
+    UITextRange *endRange = [keyInputField textRangeFromPosition:keyInputField.endOfDocument
+                                                     toPosition:keyInputField.endOfDocument];
+    keyInputField.selectedTextRange = endRange;
+
+    isInputingText = [keyInputField becomeFirstResponder];
+    if (isInputingText) {
+        // Undo causes issues for our sentinel-based state management.
+        [keyInputField.undoManager disableUndoRegistration];
+    }
+    else {
+        [self activateHardwareInput];
+    }
+}
+
+- (void)dismissKeyboard {
+    isInputingText = NO;
+    [self releaseAccessoryKeys];
+    [keyInputField resignFirstResponder];
+    [self activateHardwareInput];
+}
+
+- (void)releaseAccessoryKeys {
+    for (NSNumber *keyCode in [keysDown allObjects]) {
+        [KeyboardSupport sendKeyCode:keyCode.unsignedShortValue down:NO modifiers:0];
+    }
+    [self resetAccessoryKeyState];
+}
+
+- (void)resetAccessoryKeyState {
+    for (UIButton *button in keyboardAccessoryButtons) {
+        if (button.selected) {
+            button.selected = NO;
+            [self updateKeyboardAccessoryButtonState:button];
+        }
+    }
+    [keysDown removeAllObjects];
+}
+
+- (void)toolbarButtonClicked:(UIButton *)sender {
+    BOOL isToggleable = [objc_getAssociatedObject(sender, &KeyboardButtonToggleAssociation) boolValue];
+    u_short keyCode = [objc_getAssociatedObject(sender, &KeyboardButtonKeyCodeAssociation) unsignedShortValue];
+    if (keyCode == 0) {
+        [self dismissKeyboard];
+        return;
+    }
+
+    if (isToggleable) {
+        sender.selected = !sender.selected;
+        [self updateKeyboardAccessoryButtonState:sender];
+        [KeyboardSupport sendKeyCode:keyCode down:sender.selected modifiers:0];
+        if (sender.selected) {
+            [keysDown addObject:@(keyCode)];
+        }
+        else {
+            [keysDown removeObject:@(keyCode)];
+        }
+    }
+    else {
+        [KeyboardSupport sendKeyStroke:keyCode modifiers:0];
+    }
+}
+#endif
 
 - (BOOL)handleMouseButtonEvent:(int)buttonAction forTouches:(NSSet *)touches withEvent:(UIEvent *)event {
 #if !TARGET_OS_TV
     if (@available(iOS 13.4, *)) {
         UITouch* touch = [touches anyObject];
         if (touch.type == UITouchTypeIndirectPointer) {
-            if (@available(iOS 14.0, *)) {
-                if ([GCMouse current] != nil) {
-                    // We'll handle this with GCMouse. Do nothing here.
-                    return YES;
-                }
-            }
-            
             UIEventButtonMask normalizedButtonMask;
             
             // iOS 14 includes the released button in the buttonMask for the release
@@ -495,7 +850,7 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
                 }
                 
                 if (changedButtons & buttonFlag) {
-                    LiSendMouseButtonEvent(buttonAction, i);
+                    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceUIKitMouse, buttonAction, i);
                 }
             }
             
@@ -509,6 +864,9 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 }
 
 - (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
+    if (atomic_load_explicit(&inputSuspended, memory_order_acquire)) {
+        return;
+    }
 #if !TARGET_OS_TV
     if (@available(iOS 13.4, *)) {
         for (UITouch* touch in touches) {
@@ -521,11 +879,9 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
         
         UITouch *touch = [touches anyObject];
         if (touch.type == UITouchTypeIndirectPointer) {
-            if (@available(iOS 14.0, *)) {
-                if ([GCMouse current] != nil) {
-                    // We'll handle this with GCMouse. Do nothing here.
-                    return;
-                }
+            if (MoonlightHasRecentGCMouseMotion()) {
+                // Relative GCMouse motion is active for this device.
+                return;
             }
             
             // We must handle this event to properly support
@@ -585,7 +941,26 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
     }
 }
 
+- (void)pressesCancelled:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    BOOL handled = NO;
+
+    if (@available(iOS 13.4, tvOS 13.4, *)) {
+        for (UIPress *press in presses) {
+            if ([KeyboardSupport sendKeyEventForPress:press down:NO]) {
+                handled = YES;
+            }
+        }
+    }
+
+    if (!handled) {
+        [super pressesCancelled:presses withEvent:event];
+    }
+}
+
 - (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event {
+    if (atomic_load_explicit(&inputSuspended, memory_order_acquire)) {
+        return;
+    }
     if ([self handleMouseButtonEvent:BUTTON_ACTION_RELEASE
                           forTouches:touches
                            withEvent:event]) {
@@ -615,7 +990,12 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 }
 
 - (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
-    [touchHandler touchesCancelled:touches withEvent:event];
+    if (atomic_load_explicit(&inputSuspended, memory_order_acquire)) {
+        return;
+    }
+    if (![onScreenControls handleTouchUpEvent:touches]) {
+        [touchHandler touchesCancelled:touches withEvent:event];
+    }
     [self handleMouseButtonEvent:BUTTON_ACTION_RELEASE
                       forTouches:touches
                        withEvent:event];
@@ -632,6 +1012,9 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 
 #if !TARGET_OS_TV
 - (void) updateCursorLocation:(CGPoint)location isMouse:(BOOL)isMouse {
+    if (atomic_load_explicit(&inputSuspended, memory_order_acquire)) {
+        return;
+    }
     CGPoint normalizedLocation = [self adjustCoordinatesForVideoArea:location];
     CGSize videoSize = [self getVideoAreaSize];
     
@@ -657,11 +1040,9 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 - (UIPointerRegion *)pointerInteraction:(UIPointerInteraction *)interaction
                        regionForRequest:(UIPointerRegionRequest *)request
                           defaultRegion:(UIPointerRegion *)defaultRegion API_AVAILABLE(ios(13.4)) {
-    if (@available(iOS 14.0, *)) {
-        if ([GCMouse current] != nil) {
-            // We'll handle this with GCMouse. Do nothing here.
-            return nil;
-        }
+    if (MoonlightHasRecentGCMouseMotion()) {
+        // Relative GCMouse motion is active for this device.
+        return nil;
     }
     
     // This logic mimics what iOS does with AVLayerVideoGravityResizeAspect
@@ -690,7 +1071,26 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
     return [UIPointerStyle hiddenPointerStyle];
 }
 
+- (void)mouseHovered:(UIHoverGestureRecognizer *)gesture API_AVAILABLE(ios(13.4)) {
+    if (atomic_load_explicit(&inputSuspended, memory_order_acquire)) {
+        return;
+    }
+    if (MoonlightHasRecentGCMouseMotion()) {
+        // Relative movement is already delivered by ControllerSupport.
+        return;
+    }
+
+    if (gesture.state == UIGestureRecognizerStateBegan ||
+        gesture.state == UIGestureRecognizerStateChanged) {
+        [self updateCursorLocation:[gesture locationInView:self] isMouse:YES];
+    }
+}
+
 - (void)mouseWheelMovedContinuous:(UIPanGestureRecognizer *)gesture {
+    if (atomic_load_explicit(&inputSuspended, memory_order_acquire)) {
+        lastScrollTranslation = CGPointZero;
+        return;
+    }
     switch (gesture.state) {
         case UIGestureRecognizerStateBegan:
         case UIGestureRecognizerStateChanged:
@@ -725,6 +1125,10 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 }
 
 - (void)mouseWheelMovedDiscrete:(UIPanGestureRecognizer *)gesture {
+    if (atomic_load_explicit(&inputSuspended, memory_order_acquire)) {
+        lastScrollTranslation = CGPointZero;
+        return;
+    }
     switch (gesture.state) {
         case UIGestureRecognizerStateBegan:
         case UIGestureRecognizerStateChanged:
@@ -771,60 +1175,83 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
     }
 }
 
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+#if !TARGET_OS_TV
+    if (gestureRecognizer == keyboardToggleGestureRecognizer) {
+        CGRect safeBounds = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
+        CGRect keyboardGestureArea = CGRectInset(safeBounds,
+                                                 CGRectGetWidth(safeBounds) * 0.16,
+                                                 CGRectGetHeight(safeBounds) * 0.12);
+        return CGRectContainsPoint(keyboardGestureArea, [touch locationInView:self]);
+    }
+#endif
+    return YES;
+}
+
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
     // This method is called when the "Return" key is pressed.
-    LiSendKeyboardEvent(0x0d, KEY_ACTION_DOWN, 0);
-    usleep(50 * 1000);
-    LiSendKeyboardEvent(0x0d, KEY_ACTION_UP, 0);
+    [KeyboardSupport sendKeyStroke:0x0D modifiers:0];
     return NO;
 }
 
 - (void)textFieldDidEndEditing:(UITextField *)textField {
-    for (NSNumber* keyCode in keysDown) {
-        LiSendKeyboardEvent([keyCode shortValue], KEY_ACTION_UP, 0);
-    }
-    [keysDown removeAllObjects];
+    isInputingText = NO;
+#if !TARGET_OS_TV
+    [self releaseAccessoryKeys];
+#endif
+    [self activateHardwareInput];
 }
 
 - (void)onKeyboardPressed:(UITextField *)textField {
+    // Wait for IME/dictation composition to commit before consuming and
+    // resetting the sentinel field. Resetting marked text mid-composition
+    // breaks CJK, Arabic, dictation, and multi-scalar emoji input.
+    if (textField.markedTextRange != nil) {
+        return;
+    }
+
     NSString* inputText = textField.text;
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        // If the text became empty, we know the user pressed the backspace key.
-        if ([inputText isEqual:@""]) {
-            LiSendKeyboardEvent(0x08, KEY_ACTION_DOWN, 0);
-            usleep(50 * 1000);
-            LiSendKeyboardEvent(0x08, KEY_ACTION_UP, 0);
-        } else {
-            // Character 0 will be our known sentinel value
-            
-            // Check if any characters exist which can't be represented in a basic key event
-            for (int i = 1; i < [inputText length]; i++) {
-                struct KeyEvent event = [KeyboardSupport translateKeyEvent:[inputText characterAtIndex:i] withModifierFlags:0];
-                if (event.keycode == 0) {
-                    // We found an unknown key, so send the entire string as UTF-8
-                    const char* utf8String = [inputText UTF8String];
-                    
-                    // Skip the first character which is our sentinel
-                    LiSendUtf8TextEvent(utf8String + 1, (int)strlen(utf8String) - 1);
-                    return;
-                }
-            }
-            
-            // We didn't find any unknown characters, so send them all as basic key events
-            for (int i = 1; i < [inputText length]; i++) {
-                struct KeyEvent event = [KeyboardSupport translateKeyEvent:[inputText characterAtIndex:i] withModifierFlags:0];
-                assert(event.keycode != 0);
-                [self sendLowLevelEvent:event];
-            }
-        }
-    });
-    
+
     // Reset text field back to known state
     textField.text = @"0";
-    
+
     // Move the insertion point back to the end of the text box
     UITextRange *textRange = [textField textRangeFromPosition:textField.endOfDocument toPosition:textField.endOfDocument];
     [textField setSelectedTextRange:textRange];
+
+    // If the text became empty, we know the user pressed the backspace key.
+    if ([inputText isEqual:@""]) {
+        [KeyboardSupport sendKeyStroke:0x08 modifiers:0];
+        return;
+    }
+    if (inputText.length <= 1) {
+        return;
+    }
+
+    NSString *committedText = [inputText substringFromIndex:1];
+    if (committedText.length > 1) {
+        // Paste, dictation, and multi-character IME commits should be sent as
+        // one UTF-8 payload instead of building a 50 ms-per-character backlog.
+        [KeyboardSupport sendUtf8Text:committedText];
+        return;
+    }
+
+    // Character 0 is our sentinel value. Check the payload for characters
+    // that cannot be represented as basic key events.
+    for (NSUInteger i = 1; i < inputText.length; i++) {
+        struct KeyEvent event = [KeyboardSupport translateKeyEvent:[inputText characterAtIndex:i]
+                                                 withModifierFlags:0];
+        if (event.keycode == 0) {
+            [KeyboardSupport sendUtf8Text:committedText];
+            return;
+        }
+    }
+
+    for (NSUInteger i = 1; i < inputText.length; i++) {
+        struct KeyEvent event = [KeyboardSupport translateKeyEvent:[inputText characterAtIndex:i]
+                                                 withModifierFlags:0];
+        [self sendLowLevelEvent:event];
+    }
 }
 
 - (void)specialCharPressed:(UIKeyCommand *)cmd {
@@ -839,20 +1266,7 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 }
 
 - (void)sendLowLevelEvent:(struct KeyEvent)event {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        // When we want to send a modified key (like uppercase letters) we need to send the
-        // modifier ("shift") seperately from the key itself.
-        if (event.modifier != 0) {
-            LiSendKeyboardEvent(event.modifierKeycode, KEY_ACTION_DOWN, event.modifier);
-        }
-        // Let the host know these are not (necessarily) normalized to US English scancodes
-        LiSendKeyboardEvent2(event.keycode, KEY_ACTION_DOWN, event.modifier, SS_KBE_FLAG_NON_NORMALIZED);
-        usleep(50 * 1000);
-        LiSendKeyboardEvent2(event.keycode, KEY_ACTION_UP, event.modifier, SS_KBE_FLAG_NON_NORMALIZED);
-        if (event.modifier != 0) {
-            LiSendKeyboardEvent(event.modifierKeycode, KEY_ACTION_UP, event.modifier);
-        }
-    });
+    [KeyboardSupport sendTranslatedKeyEvent:event];
 }
 
 - (BOOL)canBecomeFirstResponder {
@@ -908,6 +1322,9 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 }
 
 - (void)mouseDidMoveWithIdentifier:(NSUUID * _Nonnull)identifier deltaX:(int16_t)deltaX deltaY:(int16_t)deltaY {
+    if (atomic_load(&inputSuspended)) {
+        return;
+    }
     accumulatedMouseDeltaX += deltaX / X1_MOUSE_SPEED_DIVISOR;
     accumulatedMouseDeltaY += deltaY / X1_MOUSE_SPEED_DIVISOR;
     
@@ -938,14 +1355,17 @@ static const double X1_MOUSE_SPEED_DIVISOR = 2.5;
 }
 
 - (void)mouseDownWithIdentifier:(NSUUID * _Nonnull)identifier button:(enum X1MouseButton)button {
-    LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, [self buttonFromX1ButtonCode:button]);
+    if (atomic_load(&inputSuspended)) return;
+    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceX1Mouse, BUTTON_ACTION_PRESS, [self buttonFromX1ButtonCode:button]);
 }
 
 - (void)mouseUpWithIdentifier:(NSUUID * _Nonnull)identifier button:(enum X1MouseButton)button {
-    LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, [self buttonFromX1ButtonCode:button]);
+    if (atomic_load(&inputSuspended)) return;
+    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceX1Mouse, BUTTON_ACTION_RELEASE, [self buttonFromX1ButtonCode:button]);
 }
 
 - (void)wheelDidScrollWithIdentifier:(NSUUID * _Nonnull)identifier deltaZ:(int8_t)deltaZ {
+    if (atomic_load(&inputSuspended)) return;
     LiSendScrollEvent(deltaZ);
 }
 

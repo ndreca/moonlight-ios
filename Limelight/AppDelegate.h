@@ -8,6 +8,10 @@
 
 #import <UIKit/UIKit.h>
 
+#if !TARGET_OS_TV
+FOUNDATION_EXPORT NSNotificationName const MoonlightShortcutItemReceivedNotification;
+#endif
+
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
 
 @property (strong, nonatomic) UIWindow *window;
@@ -18,6 +22,7 @@
 @property (readonly, strong, nonatomic) NSManagedObjectModel *managedObjectModel;
 @property (readonly, strong, nonatomic) NSPersistentStoreCoordinator *persistentStoreCoordinator;
 
+- (UIWindow *)activeWindow;
 - (void)saveContext;
 - (NSURL *)applicationDocumentsDirectory;
 - (NSURL*) getStoreURL;

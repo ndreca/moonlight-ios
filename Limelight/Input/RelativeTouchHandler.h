@@ -10,7 +10,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface RelativeTouchHandler : UIResponder
+@interface RelativeTouchHandler : UIResponder <MoonlightTouchHandler>
 
 -(id)initWithView:(StreamView*)view;
 

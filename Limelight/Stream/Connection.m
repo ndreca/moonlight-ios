@@ -16,6 +16,7 @@
 
 #include "Limelight.h"
 #include "opus_multistream.h"
+#include <stdatomic.h>
 
 @implementation Connection {
     SERVER_INFORMATION _serverInfo;
@@ -27,9 +28,18 @@
     char _appVersionString[32];
     char _gfeVersionString[32];
     char _rtspSessionUrl[128];
+    VideoDecoderRenderer* _instanceRenderer;
+    __weak id<ConnectionCallbacks> _instanceCallbacks;
+    uint64_t _generation;
+    _Atomic(bool) _terminated;
+    NSMutableArray<dispatch_block_t>* _terminationCompletions;
+    BOOL _terminationFinished;
 }
 
-static NSLock* initLock;
+static NSLock* lifecycleLock;
+static NSLock* connectionStateLock;
+static uint64_t nextConnectionGeneration;
+static uint64_t activeConnectionGeneration;
 static OpusMSDecoder* opusDecoder;
 static id<ConnectionCallbacks> _callbacks;
 static int lastFrameNumber;
@@ -351,53 +361,154 @@ void ClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t
     [_callbacks setControllerLed:controllerNumber r:r g:g b:b];
 }
 
+-(void) finishTermination
+{
+    NSArray<dispatch_block_t>* completions;
+    @synchronized(self) {
+        _terminationFinished = YES;
+        completions = [_terminationCompletions copy];
+        [_terminationCompletions removeAllObjects];
+    }
+
+    for (dispatch_block_t completion in completions) {
+        dispatch_async(dispatch_get_main_queue(), completion);
+    }
+}
+
 -(void) terminate
 {
-    // Interrupt any action blocking LiStartConnection(). This is
-    // thread-safe and done outside initLock on purpose, since we
-    // won't be able to acquire it if LiStartConnection is in
-    // progress.
-    LiInterruptConnection();
+    [self terminateWithCompletion:nil];
+}
+
+-(void) terminateWithCompletion:(dispatch_block_t)completion
+{
+    // A Connection can be terminated from several paths (navigation,
+    // backgrounding, and common callbacks). Only the first request owns the
+    // teardown for this generation.
+    BOOL completionAlreadyAvailable = NO;
+    BOOL shouldBeginTermination;
+    @synchronized(self) {
+        if (completion != nil) {
+            if (_terminationFinished) {
+                completionAlreadyAvailable = YES;
+            }
+            else {
+                [_terminationCompletions addObject:[completion copy]];
+            }
+        }
+        shouldBeginTermination = !atomic_exchange_explicit(&_terminated, true, memory_order_acq_rel);
+    }
+
+    if (completionAlreadyAvailable) {
+        dispatch_async(dispatch_get_main_queue(), completion);
+    }
+    if (!shouldBeginTermination) {
+        return;
+    }
+
+    // Interrupt LiStartConnection() only if this object still owns the
+    // process-global Limelight connection. An older Connection must never
+    // interrupt a newer stream that has already taken ownership.
+    [connectionStateLock lock];
+    BOOL ownsActiveConnection = activeConnectionGeneration == _generation;
+    if (ownsActiveConnection) {
+        LiInterruptConnection();
+    }
+    [connectionStateLock unlock];
     
     // We dispatch this async to get out because this can be invoked
     // on a thread inside common and we don't want to deadlock. It also avoids
-    // blocking on the caller's thread waiting to acquire initLock.
+    // blocking on the caller's thread waiting for LiStartConnection().
+    uint64_t generation = _generation;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        [initLock lock];
-        LiStopConnection();
-        [initLock unlock];
+        [lifecycleLock lock];
+
+        [connectionStateLock lock];
+        BOOL shouldStop = activeConnectionGeneration == generation;
+        [connectionStateLock unlock];
+
+        if (shouldStop) {
+            LiStopConnection();
+
+            [connectionStateLock lock];
+            if (activeConnectionGeneration == generation) {
+                activeConnectionGeneration = 0;
+                renderer = nil;
+                _callbacks = nil;
+            }
+            [connectionStateLock unlock];
+        }
+
+        [self->_instanceRenderer stop];
+        self->_instanceRenderer = nil;
+        self->_instanceCallbacks = nil;
+
+        [lifecycleLock unlock];
+        [self finishTermination];
     });
 }
 
 -(id) initWithConfig:(StreamConfiguration*)config renderer:(VideoDecoderRenderer*)myRenderer connectionCallbacks:(id<ConnectionCallbacks>)callbacks
 {
     self = [super init];
+    if (self == nil) {
+        return nil;
+    }
 
-    // Use a lock to ensure that only one thread is initializing
-    // or deinitializing a connection at a time.
-    if (initLock == nil) {
-        initLock = [[NSLock alloc] init];
-    }
-    
-    if (videoStatsLock == nil) {
+    // Limelight's C core is process-global. Initialize its lifecycle locks
+    // exactly once and give each Objective-C wrapper a stable generation so
+    // delayed teardown from an old stream cannot stop a new one.
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        lifecycleLock = [[NSLock alloc] init];
+        connectionStateLock = [[NSLock alloc] init];
         videoStatsLock = [[NSLock alloc] init];
-    }
+    });
+
+    [connectionStateLock lock];
+    _generation = ++nextConnectionGeneration;
+    [connectionStateLock unlock];
+
+    atomic_init(&_terminated, false);
+    _terminationCompletions = [[NSMutableArray alloc] init];
+    _instanceRenderer = myRenderer;
+    _instanceCallbacks = callbacks;
     
     NSString *rawAddress = [Utils addressPortStringToAddress:config.host];
+    const char *rawAddressString = rawAddress.UTF8String;
+    const char *appVersionString = config.appVersion.UTF8String;
+    if (rawAddressString == NULL || appVersionString == NULL ||
+        config.riKey.length != sizeof(_streamConfig.remoteInputAesKey) ||
+        config.width <= 0 || config.height <= 0 || config.frameRate <= 0 ||
+        config.bitRate <= 0 || config.audioConfiguration == 0 ||
+        config.supportedVideoFormats == 0 || config.serverCodecModeSupport == 0) {
+        Log(LOG_E, @"Invalid stream configuration; refusing to construct a connection");
+        return nil;
+    }
     strncpy(_hostString,
-            [rawAddress cStringUsingEncoding:NSUTF8StringEncoding],
+            rawAddressString,
             sizeof(_hostString) - 1);
     strncpy(_appVersionString,
-            [config.appVersion cStringUsingEncoding:NSUTF8StringEncoding],
+            appVersionString,
             sizeof(_appVersionString) - 1);
     if (config.gfeVersion != nil) {
+        const char *gfeVersionString = config.gfeVersion.UTF8String;
+        if (gfeVersionString == NULL) {
+            Log(LOG_E, @"Invalid GFE version string");
+            return nil;
+        }
         strncpy(_gfeVersionString,
-                [config.gfeVersion cStringUsingEncoding:NSUTF8StringEncoding],
+                gfeVersionString,
                 sizeof(_gfeVersionString) - 1);
     }
     if (config.rtspSessionUrl != nil) {
+        const char *rtspSessionUrlString = config.rtspSessionUrl.UTF8String;
+        if (rtspSessionUrlString == NULL) {
+            Log(LOG_E, @"Invalid RTSP session URL");
+            return nil;
+        }
         strncpy(_rtspSessionUrl,
-                [config.rtspSessionUrl cStringUsingEncoding:NSUTF8StringEncoding],
+                rtspSessionUrlString,
                 sizeof(_rtspSessionUrl) - 1);
     }
 
@@ -411,9 +522,6 @@ void ClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t
         _serverInfo.rtspSessionUrl = _rtspSessionUrl;
     }
     _serverInfo.serverCodecModeSupport = config.serverCodecModeSupport;
-
-    renderer = myRenderer;
-    _callbacks = callbacks;
 
     LiInitializeStreamConfiguration(&_streamConfig);
     _streamConfig.width = config.width;
@@ -477,15 +585,91 @@ void ClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t
 
 -(void) main
 {
-    [initLock lock];
-    LiStartConnection(&_serverInfo,
-                      &_streamConfig,
-                      &_clCallbacks,
-                      &_drCallbacks,
-                      &_arCallbacks,
-                      NULL, 0,
-                      NULL, 0);
-    [initLock unlock];
+    [lifecycleLock lock];
+
+    if (atomic_load_explicit(&_terminated, memory_order_acquire) || self.cancelled) {
+        [lifecycleLock unlock];
+        return;
+    }
+
+    // If a prior generation is still active, finish its global C lifecycle
+    // before publishing this generation's renderer and callbacks. A queued
+    // teardown from that prior object will recheck its generation and become
+    // a no-op once this stream owns the connection.
+    [connectionStateLock lock];
+    BOOL isLatestGeneration = _generation == nextConnectionGeneration;
+    BOOL isAlreadyActive = activeConnectionGeneration == _generation;
+    uint64_t priorGeneration = activeConnectionGeneration;
+    [connectionStateLock unlock];
+
+    // Operation queues may run an older wrapper after a newer stream has
+    // already been requested. Such an operation is stale and must not tear
+    // down or replace the newer generation.
+    if (!isLatestGeneration || isAlreadyActive) {
+        [lifecycleLock unlock];
+        return;
+    }
+
+    if (priorGeneration != 0) {
+        LiInterruptConnection();
+        LiStopConnection();
+
+        [connectionStateLock lock];
+        if (activeConnectionGeneration == priorGeneration) {
+            activeConnectionGeneration = 0;
+            renderer = nil;
+            _callbacks = nil;
+        }
+        [connectionStateLock unlock];
+    }
+
+    // ClConnectionTerminated reads the Objective-C process-global callback
+    // target. Drain the prior generation's asynchronous termination before
+    // publishing a new target, not merely before common replaces its C table.
+    LiWaitForPendingTerminationCallback();
+
+    [connectionStateLock lock];
+    isLatestGeneration = _generation == nextConnectionGeneration;
+    BOOL shouldStart = isLatestGeneration &&
+                       !atomic_load_explicit(&_terminated, memory_order_acquire) &&
+                       !self.cancelled;
+    if (shouldStart) {
+        activeConnectionGeneration = _generation;
+        renderer = _instanceRenderer;
+        _callbacks = _instanceCallbacks;
+    }
+    [connectionStateLock unlock];
+
+    // A newer wrapper may have been created while the prior C connection was
+    // stopping. Leave ownership to that generation instead of resurrecting
+    // this one.
+    if (!shouldStart) {
+        [lifecycleLock unlock];
+        return;
+    }
+
+    int result = LiStartConnection(&_serverInfo,
+                                   &_streamConfig,
+                                   &_clCallbacks,
+                                   &_drCallbacks,
+                                   &_arCallbacks,
+                                   NULL, 0,
+                                   NULL, 0);
+    if (result != 0) {
+        // common has already unwound its C lifecycle on a failed start. Do
+        // not leave a failed generation or its view graph published globally.
+        [connectionStateLock lock];
+        if (activeConnectionGeneration == _generation) {
+            activeConnectionGeneration = 0;
+            renderer = nil;
+            _callbacks = nil;
+        }
+        [connectionStateLock unlock];
+        [_instanceRenderer stop];
+        _instanceRenderer = nil;
+        _instanceCallbacks = nil;
+    }
+    [lifecycleLock unlock];
 }
 
 @end
