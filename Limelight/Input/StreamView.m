@@ -1273,6 +1273,21 @@ static char KeyboardButtonToggleAssociation;
     return YES;
 }
 
+- (UIKeyCommand *)priorityStreamKeyCommandWithInput:(NSString *)input
+                                      modifierFlags:(UIKeyModifierFlags)modifierFlags
+                                              action:(SEL)action {
+    UIKeyCommand *command = [UIKeyCommand keyCommandWithInput:input
+                                                modifierFlags:modifierFlags
+                                                       action:action];
+    if (@available(iOS 15.0, tvOS 15.0, *)) {
+        // A streaming client is the destination for remote shortcuts. Ask
+        // UIKit to prefer the stream over conflicting system behaviors such
+        // as Spotlight for Command-Space whenever iPadOS allows an override.
+        command.wantsPriorityOverSystemBehavior = YES;
+    }
+    return command;
+}
+
 - (NSArray<UIKeyCommand *> *)keyCommands
 {
     NSString *charset = @"qwertyuiopasdfghjklzxcvbnm1234567890\t§[]\\'\"/.,`<>-´ç+`¡'º;ñ= ";
@@ -1287,6 +1302,18 @@ static char KeyboardButtonToggleAssociation;
                                  [commands addObject:[UIKeyCommand keyCommandWithInput:substring modifierFlags:UIKeyModifierShift action:@selector(keyPressed:)]];
                                  [commands addObject:[UIKeyCommand keyCommandWithInput:substring modifierFlags:UIKeyModifierControl action:@selector(keyPressed:)]];
                                  [commands addObject:[UIKeyCommand keyCommandWithInput:substring modifierFlags:UIKeyModifierAlternate action:@selector(keyPressed:)]];
+                                 [commands addObject:[self priorityStreamKeyCommandWithInput:substring
+                                                                              modifierFlags:UIKeyModifierCommand
+                                                                                      action:@selector(keyPressed:)]];
+                                 [commands addObject:[self priorityStreamKeyCommandWithInput:substring
+                                                                              modifierFlags:UIKeyModifierCommand | UIKeyModifierShift
+                                                                                      action:@selector(keyPressed:)]];
+                                 [commands addObject:[self priorityStreamKeyCommandWithInput:substring
+                                                                              modifierFlags:UIKeyModifierCommand | UIKeyModifierAlternate
+                                                                                      action:@selector(keyPressed:)]];
+                                 [commands addObject:[self priorityStreamKeyCommandWithInput:substring
+                                                                              modifierFlags:UIKeyModifierCommand | UIKeyModifierControl
+                                                                                      action:@selector(keyPressed:)]];
                              }];
     
     for (NSString *c in [dictCodes keyEnumerator]) {
@@ -1311,6 +1338,18 @@ static char KeyboardButtonToggleAssociation;
         [commands addObject:[UIKeyCommand keyCommandWithInput:c
                                                 modifierFlags:UIKeyModifierAlternate
                                                        action:@selector(specialCharPressed:)]];
+        [commands addObject:[self priorityStreamKeyCommandWithInput:c
+                                                      modifierFlags:UIKeyModifierCommand
+                                                              action:@selector(specialCharPressed:)]];
+        [commands addObject:[self priorityStreamKeyCommandWithInput:c
+                                                      modifierFlags:UIKeyModifierCommand | UIKeyModifierShift
+                                                              action:@selector(specialCharPressed:)]];
+        [commands addObject:[self priorityStreamKeyCommandWithInput:c
+                                                      modifierFlags:UIKeyModifierCommand | UIKeyModifierAlternate
+                                                              action:@selector(specialCharPressed:)]];
+        [commands addObject:[self priorityStreamKeyCommandWithInput:c
+                                                      modifierFlags:UIKeyModifierCommand | UIKeyModifierControl
+                                                              action:@selector(specialCharPressed:)]];
     }
     
     return commands;
