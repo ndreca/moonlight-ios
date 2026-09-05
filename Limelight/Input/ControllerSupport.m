@@ -136,6 +136,7 @@ void MoonlightSetMouseInputSuspended(BOOL suspended) {
     bool _controllerPointerModeAvailable;
     bool _autoEnableControllerPointerForDesktop;
     bool _connectionEstablished;
+    _Atomic(bool) _controllerPointerModeUserOverride;
     bool _hasObservedGCMouseMotion;
     uint64_t _gcMouseMotionGeneration;
     bool _cleanupComplete;
@@ -651,6 +652,9 @@ void MoonlightSetMouseInputSuspended(BOOL suspended) {
     }
 
     if (changed && notifyDelegate) {
+        Log(LOG_I, @"Controller %ld pointer mode %@",
+            (long)controller.playerIndex,
+            enabled ? @"enabled" : @"disabled");
         [self notifyControllerPointerModeChanged:controller enabled:enabled];
     }
 }
@@ -659,6 +663,7 @@ void MoonlightSetMouseInputSuspended(BOOL suspended) {
 {
     if (!_connectionEstablished ||
         !_autoEnableControllerPointerForDesktop ||
+        atomic_load_explicit(&_controllerPointerModeUserOverride, memory_order_acquire) ||
         atomic_load(&_inputSuspended) ||
         controller == nil) {
         return;
@@ -791,6 +796,7 @@ void MoonlightSetMouseInputSuspended(BOOL suspended) {
                 }
             }
             if (activate) {
+                atomic_store_explicit(&self->_controllerPointerModeUserOverride, true, memory_order_release);
                 [self setControllerPointerMode:controller enabled:enabled notifyDelegate:YES];
             }
         });
@@ -824,6 +830,7 @@ void MoonlightSetMouseInputSuspended(BOOL suspended) {
         [self clearButtonFlag:controller flags:PLAY_FLAG];
     }
     if (shouldToggle) {
+        atomic_store_explicit(&_controllerPointerModeUserOverride, true, memory_order_release);
         [self setControllerPointerMode:controller enabled:enablePointerMode notifyDelegate:YES];
     }
     return emitShortMenuTap;
@@ -1405,6 +1412,7 @@ void MoonlightSetMouseInputSuspended(BOOL suspended) {
                         @synchronized(limeController) {
                             enablePointerMode = !limeController.pointerModeEnabled;
                         }
+                        atomic_store_explicit(&self->_controllerPointerModeUserOverride, true, memory_order_release);
                         [self setControllerPointerMode:limeController
                                                enabled:enablePointerMode
                                         notifyDelegate:YES];
@@ -1857,6 +1865,7 @@ void MoonlightSetMouseInputSuspended(BOOL suspended) {
     _controllerStreamLock = [[NSLock alloc] init];
     _controllers = [[NSMutableDictionary alloc] init];
     atomic_init(&_inputSuspended, false);
+    atomic_init(&_controllerPointerModeUserOverride, false);
     MoonlightSetMouseInputSuspended(NO);
     _controllerNumbers = 0;
     _multiController = streamConfig.multiController;
