@@ -50,7 +50,6 @@ static char KeyboardButtonToggleAssociation;
 
 @implementation StreamView {
     OnScreenControls* onScreenControls;
-    __weak ControllerSupport* controllerSupport;
     
     KeyboardInputField* keyInputField;
     BOOL isInputingText;
@@ -90,7 +89,6 @@ static char KeyboardButtonToggleAssociation;
      interactionDelegate:(id<UserInteractionDelegate>)interactionDelegate
                   config:(StreamConfiguration*)streamConfig {
     atomic_init(&inputSuspended, false);
-    self->controllerSupport = controllerSupport;
     self->interactionDelegate = interactionDelegate;
     self->streamAspectRatio = (float)streamConfig.width / (float)streamConfig.height;
     
@@ -885,12 +883,6 @@ static char KeyboardButtonToggleAssociation;
                 // Relative GCMouse motion is active for this device.
                 return;
             }
-            if ([controllerSupport hasActiveControllerStickInput]) {
-                // iPadOS may drive its indirect pointer from a connected gamepad
-                // after a physical trackpad has activated the pointer system.
-                // Keep that synthetic hover motion out of the remote mouse path.
-                return;
-            }
             
             // We must handle this event to properly support
             // drags while the middle, X1, or X2 mouse buttons are
@@ -1066,7 +1058,7 @@ static char KeyboardButtonToggleAssociation;
     
     // Move the cursor on the host if no buttons are pressed.
     // Motion with buttons pressed in handled in touchesMoved:
-    if (lastMouseButtonMask == 0 && ![controllerSupport hasActiveControllerStickInput]) {
+    if (lastMouseButtonMask == 0) {
         [self updateCursorLocation:request.location isMouse:YES];
     }
     
@@ -1085,10 +1077,6 @@ static char KeyboardButtonToggleAssociation;
     }
     if (MoonlightHasRecentGCMouseMotion()) {
         // Relative movement is already delivered by ControllerSupport.
-        return;
-    }
-    if ([controllerSupport hasActiveControllerStickInput]) {
-        // Ignore iPadOS pointer motion synthesized from gamepad navigation.
         return;
     }
 

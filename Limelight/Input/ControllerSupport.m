@@ -33,7 +33,6 @@ static const float CONTROLLER_POINTER_MODE_DEADZONE = 0.18f;
 static const float CONTROLLER_POINTER_MODE_MAX_DELTA = 15.0f;
 static const float CONTROLLER_POINTER_MODE_SMOOTHING = 0.42f;
 static const short CONTROLLER_POINTER_MODE_SCROLL_DELTA = 120;
-static const short CONTROLLER_SYSTEM_POINTER_SUPPRESSION_DEADZONE = 0x1000;
 
 static BOOL MouseButtonOwners[MoonlightMouseButtonSourceCount][BUTTON_X2 + 1];
 static NSUInteger MouseButtonOwnerCounts[BUTTON_X2 + 1];
@@ -1865,27 +1864,6 @@ void MoonlightSetMouseInputSuspended(BOOL suspended) {
 -(NSUInteger) getConnectedGamepadCount
 {
     return _controllers.count;
-}
-
--(BOOL) hasActiveControllerStickInput
-{
-    NSArray<Controller *> *controllers;
-    @synchronized(self) {
-        controllers = [_controllers.allValues copy];
-    }
-
-    for (Controller *controller in controllers) {
-        @synchronized(controller) {
-            if (abs(controller.lastLeftStickX) > CONTROLLER_SYSTEM_POINTER_SUPPRESSION_DEADZONE ||
-                abs(controller.lastLeftStickY) > CONTROLLER_SYSTEM_POINTER_SUPPRESSION_DEADZONE ||
-                abs(controller.lastRightStickX) > CONTROLLER_SYSTEM_POINTER_SUPPRESSION_DEADZONE ||
-                abs(controller.lastRightStickY) > CONTROLLER_SYSTEM_POINTER_SUPPRESSION_DEADZONE) {
-                return YES;
-            }
-        }
-    }
-
-    return NO;
 }
 
 -(id) initWithConfig:(StreamConfiguration*)streamConfig delegate:(id<ControllerSupportDelegate>)delegate
