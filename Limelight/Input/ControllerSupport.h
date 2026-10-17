@@ -11,11 +11,29 @@
 
 @class OnScreenControls;
 
+typedef NS_ENUM(NSUInteger, MoonlightMouseButtonSource) {
+    MoonlightMouseButtonSourceControllerPointer = 0,
+    MoonlightMouseButtonSourcePhysicalMouse,
+    MoonlightMouseButtonSourceAbsoluteTouch,
+    MoonlightMouseButtonSourceRelativeTouch,
+    MoonlightMouseButtonSourceUIKitMouse,
+    MoonlightMouseButtonSourceX1Mouse,
+    MoonlightMouseButtonSourceCount,
+};
+
+FOUNDATION_EXPORT void MoonlightSendMouseButtonEvent(MoonlightMouseButtonSource source, int action, int button);
+FOUNDATION_EXPORT void MoonlightReleaseMouseButtons(MoonlightMouseButtonSource source);
+FOUNDATION_EXPORT void MoonlightSetMouseInputSuspended(BOOL suspended);
+FOUNDATION_EXPORT BOOL MoonlightHasRecentGCMouseMotion(void);
+
 @protocol ControllerSupportDelegate <NSObject>
 
 - (void) gamepadPresenceChanged;
 - (void) mousePresenceChanged;
 - (void) streamExitRequested;
+
+@optional
+- (void) controllerPointerModeChanged:(BOOL)enabled playerIndex:(NSInteger)playerIndex;
 
 @end
 

@@ -6,7 +6,7 @@
 //  Copyright (c) 2014 Moonlight Stream. All rights reserved.
 //
 
-#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
 @class ControllerSupport;
 @class StreamConfiguration;
@@ -29,6 +29,7 @@ typedef NS_ENUM(NSInteger, OnScreenControlsLevel) {
 - (BOOL) handleTouchDownEvent:(NSSet*)touches;
 - (BOOL) handleTouchUpEvent:(NSSet*)touches;
 - (BOOL) handleTouchMovedEvent:(NSSet*)touches;
+- (void) updateLayoutForBounds:(CGRect)bounds safeAreaInsets:(UIEdgeInsets)safeAreaInsets;
 - (void) setLevel:(OnScreenControlsLevel)level;
 - (OnScreenControlsLevel) getLevel;
 - (void) show;

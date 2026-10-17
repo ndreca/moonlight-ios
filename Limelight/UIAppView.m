@@ -37,13 +37,29 @@ static UIImage* noImage;
 #if TARGET_OS_TV
     self.frame = CGRectMake(0, 0, 200, 265);
 #else
-    self.frame = CGRectMake(0, 0, 150, 200);
+    self.frame = CGRectMake(0, 0, 142, 230);
+    self.backgroundColor = [UIColor colorWithRed:0.095 green:0.105 blue:0.130 alpha:1.0];
+    self.layer.cornerRadius = 16.0;
+    self.layer.cornerCurve = kCACornerCurveContinuous;
+    self.layer.borderWidth = 1.0;
+    self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.08].CGColor;
+    self.layer.shadowColor = UIColor.blackColor.CGColor;
+    self.layer.shadowOffset = CGSizeMake(0, 8);
+    self.layer.shadowRadius = 12.0;
+    self.layer.shadowOpacity = 0.24;
+    self.clipsToBounds = NO;
 #endif
     
     [self setAlpha:app.hidden ? 0.4 : 1.0];
     
     _appImage = [[UIImageView alloc] initWithFrame:self.frame];
     [_appImage setImage:noImage];
+#if !TARGET_OS_TV
+    _appImage.contentMode = UIViewContentModeScaleAspectFill;
+    _appImage.clipsToBounds = YES;
+    _appImage.layer.cornerRadius = 16.0;
+    _appImage.layer.cornerCurve = kCACornerCurveContinuous;
+#endif
     [self addSubview:_appImage];
     
     // Use UIContextMenuInteraction on iOS 13.0+ and a standard UILongPressGestureRecognizer
@@ -70,8 +86,7 @@ static UIImage* noImage;
 #else
     // Rasterizing the cell layer increases rendering performance by quite a bit
     // but we want it unrasterized for tvOS where it must be scaled.
-    self.layer.shouldRasterize = YES;
-    self.layer.rasterizationScale = [UIScreen mainScreen].scale;
+    self.layer.shouldRasterize = NO;
     
     if (@available(iOS 13.4.1, *)) {
         // Allow the button style to change when moused over
@@ -80,6 +95,15 @@ static UIImage* noImage;
 #endif
     
     [self updateAppImage];
+
+#if !TARGET_OS_TV
+    self.isAccessibilityElement = YES;
+    self.accessibilityTraits = UIAccessibilityTraitButton;
+    self.accessibilityLabel = _app.name;
+    self.accessibilityHint = @"Starts or resumes this app";
+    self.accessibilityIdentifier = [NSString stringWithFormat:@"app.%@", _app.id ?: _app.name];
+    _appImage.isAccessibilityElement = NO;
+#endif
     
     return self;
 }
@@ -163,7 +187,13 @@ static UIImage* noImage;
         _appLabel = [[UILabel alloc] init];
         [_appLabel setTextColor:[UIColor whiteColor]];
         [_appLabel setText:_app.name];
+#if TARGET_OS_TV
         [_appLabel setFont:[UIFont systemFontOfSize:24]];
+#else
+        [_appLabel setFont:[UIFont systemFontOfSize:14 weight:UIFontWeightSemibold]];
+        _appLabel.backgroundColor = [UIColor colorWithWhite:0.02 alpha:0.58];
+        _appLabel.adjustsFontForContentSizeCategory = YES;
+#endif
         [_appLabel setBaselineAdjustment:UIBaselineAdjustmentAlignCenters];
         [_appLabel setTextAlignment:NSTextAlignmentCenter];
         [_appLabel setLineBreakMode:NSLineBreakByWordWrapping];
@@ -182,13 +212,45 @@ static UIImage* noImage;
 }
 
 - (void) buttonSelected:(id)sender {
+#if TARGET_OS_TV
     _appImage.layer.opacity = 0.5f;
+#else
+    [UIView animateWithDuration:0.12 animations:^{
+        self.transform = CGAffineTransformMakeScale(0.97, 0.97);
+        self.alpha = self->_app.hidden ? 0.34 : 0.82;
+    }];
+#endif
 }
 - (void) buttonDeselected:(id)sender {
+#if TARGET_OS_TV
     _appImage.layer.opacity = 1.0f;
+#else
+    [UIView animateWithDuration:0.18 animations:^{
+        self.transform = self.isFocused ? CGAffineTransformMakeScale(1.045, 1.045) : CGAffineTransformIdentity;
+        self.alpha = self->_app.hidden ? 0.4 : 1.0;
+    }];
+#endif
 }
 
 - (void) positionSubviews {
+#if !TARGET_OS_TV
+    _appImage.frame = self.bounds;
+    _appImage.layer.cornerRadius = 16.0;
+
+    if (_appLabel != nil) {
+        _appLabel.frame = CGRectInset(self.bounds, 12.0, 12.0);
+        _appLabel.textAlignment = NSTextAlignmentCenter;
+        _appLabel.numberOfLines = 3;
+        _appLabel.lineBreakMode = NSLineBreakByWordWrapping;
+    }
+
+    if (_appOverlay != nil) {
+        CGFloat overlaySize = MIN(56.0, _appImage.bounds.size.width * 0.38);
+        _appOverlay.frame = CGRectMake(0, 0, overlaySize, overlaySize);
+        _appOverlay.center = CGPointMake(CGRectGetMidX(_appImage.bounds), CGRectGetMidY(_appImage.bounds));
+    }
+    return;
+#else
     CGFloat padding = 5.f;
     CGSize frameSize = _appImage.frame.size;
     CGPoint center = _appImage.center;
@@ -208,6 +270,42 @@ static UIImage* noImage;
         _appOverlay.frame = CGRectMake(0, 0, frameSize.width / 2, frameSize.width / 2);
         _appOverlay.center = center;
     }
+#endif
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [self positionSubviews];
+
+#if !TARGET_OS_TV
+    self.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.bounds cornerRadius:self.layer.cornerRadius].CGPath;
+#endif
+}
+
+- (BOOL)canBecomeFocused {
+    return self.enabled && !self.hidden;
+}
+
+- (void)setControllerHighlighted:(BOOL)highlighted {
+#if !TARGET_OS_TV
+    self.transform = highlighted ? CGAffineTransformMakeScale(1.045, 1.045) : CGAffineTransformIdentity;
+    self.layer.borderWidth = highlighted ? 3.0 : 1.0;
+    self.layer.borderColor = highlighted
+        ? [UIColor colorWithRed:0.55 green:0.48 blue:0.96 alpha:1.0].CGColor
+        : [UIColor colorWithWhite:1.0 alpha:0.08].CGColor;
+    self.layer.shadowOpacity = highlighted ? 0.50 : (_app.hidden ? 0.0 : 0.24);
+#endif
+}
+
+- (void)didUpdateFocusInContext:(UIFocusUpdateContext *)context withAnimationCoordinator:(UIFocusAnimationCoordinator *)coordinator {
+    [super didUpdateFocusInContext:context withAnimationCoordinator:coordinator];
+
+#if !TARGET_OS_TV
+    BOOL focused = context.nextFocusedView == self;
+    [coordinator addCoordinatedAnimations:^{
+        [self setControllerHighlighted:focused];
+    } completion:nil];
+#endif
 }
 
 - (void) updateLoop {
@@ -225,7 +323,11 @@ static UIImage* noImage;
     // Show no shadow for hidden apps. Because we adjust the opacity of the
     // cells for hidden apps, it makes them look bad when the shadow draws
     // through the app tile.
+#if TARGET_OS_TV
     self.superview.layer.shadowOpacity = _app.hidden ? 0.0f : 0.5f;
+#else
+    self.layer.shadowOpacity = _app.hidden ? 0.0f : (self.isFocused ? 0.50f : 0.24f);
+#endif
     
     // Update opacity if neccessary
     [self setAlpha:_app.hidden ? 0.4 : 1.0];

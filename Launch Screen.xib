@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <document type="com.apple.InterfaceBuilder3.CocoaTouch.XIB" version="3.0" toolsVersion="15505" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" launchScreen="YES" useTraitCollections="YES" colorMatched="YES">
-    <device id="retina6_1" orientation="landscape" appearance="light"/>
+    <device id="retina6_1" orientation="landscape" appearance="dark"/>
     <dependencies>
         <deployment identifier="iOS"/>
         <plugIn identifier="com.apple.InterfaceBuilder.IBCocoaTouchPlugin" version="15509"/>
@@ -12,7 +12,7 @@
         <view contentMode="scaleToFill" id="VWy-YH-qYj">
             <rect key="frame" x="0.0" y="0.0" width="896" height="414"/>
             <autoresizingMask key="autoresizingMask" flexibleMaxX="YES" flexibleMaxY="YES"/>
-            <color key="backgroundColor" white="0.33333333329999998" alpha="1" colorSpace="custom" customColorSpace="genericGamma22GrayColorSpace"/>
+            <color key="backgroundColor" red="0.055" green="0.06" blue="0.075" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
             <point key="canvasLocation" x="33" y="187"/>
         </view>
     </objects>

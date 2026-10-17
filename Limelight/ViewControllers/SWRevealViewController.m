@@ -35,15 +35,25 @@
 // it will return the statusBar height if view fully overlaps the statusBar, otherwise returns 0.0f
 static CGFloat statusBarAdjustment( UIView* view )
 {
+#if TARGET_OS_TV
+    return 0.0f;
+#else
     CGFloat adjustment = 0.0f;
-    UIApplication *app = [UIApplication sharedApplication];
-    CGRect viewFrame = [view convertRect:view.bounds toView:[app keyWindow]];
-    CGRect statusBarFrame = [app statusBarFrame];
+    UIWindow *window = view.window;
+    UIStatusBarManager *statusBarManager = window.windowScene.statusBarManager;
+    if (window == nil || statusBarManager == nil) {
+        return adjustment;
+    }
+
+    CGRect viewFrame = [view convertRect:view.bounds toView:window];
+    CGRect statusBarFrame = [window.screen.coordinateSpace convertRect:statusBarManager.statusBarFrame
+                                                     toCoordinateSpace:window];
     
     if ( CGRectIntersectsRect(viewFrame, statusBarFrame) )
         adjustment = fminf(statusBarFrame.size.width, statusBarFrame.size.height);
 
     return adjustment;
+#endif
 }
 
 
@@ -425,6 +435,12 @@ static CGFloat scaledValue( CGFloat v1, CGFloat min2, CGFloat max2, CGFloat min1
 }
 
 
+- (void)pauseInteractiveTransition
+{
+    // not supported
+}
+
+
 - (void)completeTransition:(BOOL)didComplete
 {
     _completion();
@@ -658,7 +674,7 @@ const int FrontViewPositionNone = 0xff;
 
 - (UIViewController *)childViewControllerForStatusBarStyle
 {
-    int positionDif =  _frontViewPosition - FrontViewPositionLeft;
+    NSInteger positionDif =  _frontViewPosition - FrontViewPositionLeft;
     
     UIViewController *controller = _frontViewController;
     if ( positionDif > 0 ) controller = _rearViewController;
@@ -1635,11 +1651,12 @@ const int FrontViewPositionNone = 0xff;
     
     if ( [controllerView isKindOfClass:[UIScrollView class]] )
     {
-        BOOL adjust = controller.automaticallyAdjustsScrollViewInsets;
+        UIScrollView *scrollView = (UIScrollView *)controllerView;
+        BOOL adjust = scrollView.contentInsetAdjustmentBehavior != UIScrollViewContentInsetAdjustmentNever;
         
         if ( adjust )
         {
-            [(id)controllerView setContentInset:UIEdgeInsetsMake(statusBarAdjustment(_contentView), 0, 0, 0)];
+            [scrollView setContentInset:UIEdgeInsetsMake(statusBarAdjustment(_contentView), 0, 0, 0)];
         }
     }
     
@@ -1939,5 +1956,4 @@ NSString * const SWSegueRightIdentifier = @"sw_right";
 //}
 //
 //@end
-
 

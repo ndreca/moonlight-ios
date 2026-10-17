@@ -9,13 +9,28 @@
 #import "SettingsViewController.h"
 #import "TemporarySettings.h"
 #import "DataManager.h"
+#import "SWRevealViewController.h"
 
 #import <VideoToolbox/VideoToolbox.h>
 #import <AVFoundation/AVFoundation.h>
 
+@interface SettingsViewController ()
+
+- (BOOL)isSettingsContentView:(UIView *)view;
+- (void)layoutSettingsControls;
+- (void)updateDisplayResolutionEntries;
+- (void)controllerPointerPreferenceChanged:(UISegmentedControl *)sender;
+- (void)resolutionHelpButtonPressed;
+
+@end
+
 @implementation SettingsViewController {
     NSInteger _bitrate;
     NSInteger _lastSelectedResolutionIndex;
+    UILabel *_controllerPointerLabel;
+    UISegmentedControl *_controllerPointerSelector;
+    UILabel *_controllerPointerDetailLabel;
+    UIButton *_resolutionHelpButton;
 }
 
 @dynamic overrideUserInterfaceStyle;
@@ -50,8 +65,10 @@ static const int bitrateTable[] = {
     150000,
 };
 
-const int RESOLUTION_TABLE_SIZE = 7;
-const int RESOLUTION_TABLE_CUSTOM_INDEX = RESOLUTION_TABLE_SIZE - 1;
+enum {
+    RESOLUTION_TABLE_SIZE = 7,
+    RESOLUTION_TABLE_CUSTOM_INDEX = RESOLUTION_TABLE_SIZE - 1,
+};
 CGSize resolutionTable[RESOLUTION_TABLE_SIZE];
 
 -(int)getSliderValueForBitrate:(NSInteger)bitrate {
@@ -70,6 +87,11 @@ CGSize resolutionTable[RESOLUTION_TABLE_SIZE];
 // This view is rooted at a ScrollView. To make it scrollable,
 // we'll update content size here.
 -(void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    [self updateDisplayResolutionEntries];
+    [self layoutSettingsControls];
+    [self updateResolutionDisplayViewText];
+
     CGFloat highestViewY = 0;
     
     // Enumerate the scroll view's subviews looking for the
@@ -79,9 +101,7 @@ CGSize resolutionTable[RESOLUTION_TABLE_SIZE];
         // UIScrollViews have 2 default child views
         // which represent the horizontal and vertical scrolling
         // indicators. Ignore any views we don't recognize.
-        if (![view isKindOfClass:[UILabel class]] &&
-            ![view isKindOfClass:[UISegmentedControl class]] &&
-            ![view isKindOfClass:[UISlider class]]) {
+        if (![self isSettingsContentView:view]) {
             continue;
         }
         
@@ -93,23 +113,106 @@ CGSize resolutionTable[RESOLUTION_TABLE_SIZE];
     
     // Add a bit of padding so the view doesn't end right at the button of the display
     self.scrollView.contentSize = CGSizeMake(self.scrollView.contentSize.width,
-                                             highestViewY + 20);
+                                             highestViewY + MAX(28.0, self.view.safeAreaInsets.bottom + 20.0));
 }
 
-// Adjust the subviews for the safe area on the iPhone X.
 - (void)viewSafeAreaInsetsDidChange {
     [super viewSafeAreaInsetsDidChange];
-    
-    if (@available(iOS 11.0, *)) {
-        for (UIView* view in self.view.subviews) {
-            // HACK: The official safe area is much too large for our purposes
-            // so we'll just use the presence of any safe area to indicate we should
-            // pad by 20.
-            if (self.view.safeAreaInsets.left >= 20 || self.view.safeAreaInsets.right >= 20) {
-                view.frame = CGRectMake(view.frame.origin.x + 20, view.frame.origin.y, view.frame.size.width, view.frame.size.height);
-            }
+    [self.view setNeedsLayout];
+}
+
+- (BOOL)isSettingsContentView:(UIView *)view {
+    return [view isKindOfClass:[UILabel class]] ||
+           [view isKindOfClass:[UISegmentedControl class]] ||
+           [view isKindOfClass:[UISlider class]] ||
+           view == self.resolutionDisplayView;
+}
+
+- (void)layoutSettingsControls {
+    UIEdgeInsets safeArea = self.view.safeAreaInsets;
+    // Use one symmetric inset so the form remains optically centered. The
+    // scroll indicator has its own edge lane and must not steal form width.
+    // Align the form edge with the navigation control axis in compact
+    // landscape while still clearing the Dynamic Island and rounded corners.
+    CGFloat horizontalInset = MAX(24.0, MAX(safeArea.left, safeArea.right));
+    CGFloat visibleWidth = self.view.bounds.size.width;
+    SWRevealViewController *revealController = self.revealViewController;
+    if (revealController != nil) {
+        visibleWidth = MIN(visibleWidth, revealController.rearViewRevealWidth);
+    }
+    CGFloat availableWidth = MAX(1.0, visibleWidth - horizontalInset * 2.0);
+
+    NSMutableArray<UIView *> *contentViews = [NSMutableArray array];
+    for (UIView *view in self.scrollView.subviews) {
+        if ([self isSettingsContentView:view]) {
+            [contentViews addObject:view];
         }
     }
+    [contentViews sortUsingComparator:^NSComparisonResult(UIView *left, UIView *right) {
+        CGFloat leftY = CGRectGetMinY(left.frame);
+        CGFloat rightY = CGRectGetMinY(right.frame);
+        if (leftY < rightY) return NSOrderedAscending;
+        if (leftY > rightY) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    CGFloat currentY = 20.0;
+    UIView *previousView = nil;
+    for (UIView *view in contentViews) {
+        BOOL isLabel = [view isKindOfClass:[UILabel class]];
+        BOOL previousWasLabel = [previousView isKindOfClass:[UILabel class]];
+
+        if (previousView != nil) {
+            currentY += isLabel ? (previousWasLabel ? 4.0 : 14.0) : 6.0;
+        }
+
+        CGRect frame = view.frame;
+        frame.origin.x = floor((visibleWidth - availableWidth) * 0.5);
+        frame.origin.y = currentY;
+        frame.size.width = availableWidth;
+        if (isLabel) {
+            CGSize fittingSize = [(UILabel *)view sizeThatFits:CGSizeMake(availableWidth, CGFLOAT_MAX)];
+            frame.size.height = MAX(21.0, ceil(fittingSize.height));
+        }
+        else if ([view isKindOfClass:[UISlider class]]) {
+            frame.size.height = 44.0;
+        }
+        else if (view == self.resolutionDisplayView) {
+            frame.size.height = 48.0;
+        }
+        else {
+            frame.size.height = 44.0;
+        }
+        view.frame = frame;
+        currentY = CGRectGetMaxY(frame);
+        previousView = view;
+    }
+
+    if (@available(iOS 13.0, tvOS 13.0, *)) {
+        self.scrollView.automaticallyAdjustsScrollIndicatorInsets = NO;
+    }
+    self.scrollView.verticalScrollIndicatorInsets = UIEdgeInsetsMake(12.0,
+                                                                      0,
+                                                                      safeArea.bottom + 12.0,
+                                                                      6.0);
+}
+
+- (void)updateDisplayResolutionEntries {
+    UIWindow *window = self.view.window;
+    if (window == nil) {
+        AppDelegate *appDelegate = (AppDelegate *)UIApplication.sharedApplication.delegate;
+        window = appDelegate.activeWindow;
+    }
+    if (window == nil) {
+        return;
+    }
+
+    CGFloat screenScale = window.screen.scale;
+    CGRect bounds = window.bounds;
+    UIEdgeInsets safeAreaInsets = window.safeAreaInsets;
+    resolutionTable[4] = CGSizeMake((bounds.size.width - safeAreaInsets.left - safeAreaInsets.right) * screenScale,
+                                   (bounds.size.height - safeAreaInsets.top - safeAreaInsets.bottom) * screenScale);
+    resolutionTable[5] = CGSizeMake(bounds.size.width * screenScale, bounds.size.height * screenScale);
 }
 
 BOOL isCustomResolution(CGSize res) {
@@ -133,6 +236,91 @@ BOOL isCustomResolution(CGSize res) {
     if (@available(iOS 13.0, tvOS 13.0, *)) {
         self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     }
+
+    self.view.backgroundColor = [UIColor colorWithRed:0.055 green:0.060 blue:0.075 alpha:1.0];
+    self.scrollView.backgroundColor = self.view.backgroundColor;
+    self.scrollView.indicatorStyle = UIScrollViewIndicatorStyleWhite;
+    self.scrollView.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    self.edgesForExtendedLayout = UIRectEdgeNone;
+    self.scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
+
+    for (UIView *view in self.scrollView.subviews) {
+        if ([view isKindOfClass:[UILabel class]]) {
+            UILabel *label = (UILabel *)view;
+            label.textColor = UIColor.labelColor;
+            label.adjustsFontForContentSizeCategory = YES;
+            if (label.font.pointSize >= 16.0) {
+                UIFont *baseFont = [UIFont systemFontOfSize:16.0 weight:UIFontWeightSemibold];
+                label.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleHeadline] scaledFontForFont:baseFont];
+            }
+        }
+        else if ([view isKindOfClass:[UISegmentedControl class]]) {
+            UISegmentedControl *control = (UISegmentedControl *)view;
+            UIColor *accentColor = [UIColor colorWithRed:0.55 green:0.48 blue:0.96 alpha:1.0];
+            control.selectedSegmentTintColor = accentColor;
+            control.backgroundColor = UIColor.tertiarySystemBackgroundColor;
+            [control setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.76 alpha:1.0]}
+                                   forState:UIControlStateNormal];
+            [control setTitleTextAttributes:@{NSForegroundColorAttributeName: UIColor.whiteColor,
+                                              NSFontAttributeName: [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]}
+                                   forState:UIControlStateSelected];
+        }
+        else if ([view isKindOfClass:[UISlider class]]) {
+            ((UISlider *)view).minimumTrackTintColor = [UIColor colorWithRed:0.55 green:0.48 blue:0.96 alpha:1.0];
+        }
+    }
+
+    self.resolutionDisplayView.backgroundColor = UIColor.tertiarySystemBackgroundColor;
+    self.resolutionDisplayView.layer.cornerRadius = 12.0;
+    self.resolutionDisplayView.layer.cornerCurve = kCACornerCurveContinuous;
+
+    self.resolutionSelector.accessibilityIdentifier = @"settings.resolution";
+    self.framerateSelector.accessibilityIdentifier = @"settings.framerate";
+    self.bitrateSlider.accessibilityIdentifier = @"settings.bitrate";
+    self.touchModeSelector.accessibilityIdentifier = @"settings.touchMode";
+    self.onscreenControlSelector.accessibilityIdentifier = @"settings.onscreenControls";
+
+#if !TARGET_OS_TV
+    CGFloat highestControlY = 0;
+    for (UIView *view in self.scrollView.subviews) {
+        if ([self isSettingsContentView:view]) {
+            highestControlY = MAX(highestControlY, CGRectGetMaxY(view.frame));
+        }
+    }
+
+    _controllerPointerLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, highestControlY + 26.0, 400, 22.0)];
+    _controllerPointerLabel.text = @"Gamepad mouse";
+    _controllerPointerLabel.textColor = UIColor.labelColor;
+    _controllerPointerLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleHeadline]
+        scaledFontForFont:[UIFont systemFontOfSize:16 weight:UIFontWeightSemibold]];
+    _controllerPointerLabel.adjustsFontForContentSizeCategory = YES;
+    [self.scrollView addSubview:_controllerPointerLabel];
+
+    _controllerPointerSelector = [[UISegmentedControl alloc] initWithItems:@[@"Off", @"Automatic"]];
+    _controllerPointerSelector.frame = CGRectMake(20, highestControlY + 54.0, 400, 38.0);
+    NSNumber *pointerPreference = [NSUserDefaults.standardUserDefaults objectForKey:@"ControllerPointerModeEnabled"];
+    _controllerPointerSelector.selectedSegmentIndex = pointerPreference == nil || pointerPreference.boolValue ? 1 : 0;
+    _controllerPointerSelector.selectedSegmentTintColor = [UIColor colorWithRed:0.55 green:0.48 blue:0.96 alpha:1.0];
+    _controllerPointerSelector.backgroundColor = UIColor.tertiarySystemBackgroundColor;
+    [_controllerPointerSelector setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.76 alpha:1.0]}
+                                                forState:UIControlStateNormal];
+    [_controllerPointerSelector setTitleTextAttributes:@{NSForegroundColorAttributeName: UIColor.whiteColor,
+                                                          NSFontAttributeName: [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]}
+                                                forState:UIControlStateSelected];
+    _controllerPointerSelector.accessibilityIdentifier = @"settings.controllerPointer";
+    [_controllerPointerSelector addTarget:self action:@selector(controllerPointerPreferenceChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.scrollView addSubview:_controllerPointerSelector];
+
+    _controllerPointerDetailLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, highestControlY + 102.0, 400, 44.0)];
+    _controllerPointerDetailLabel.text = @"Desktop streams start in mouse mode. Hold Start/Menu to toggle; controllers without a hold event use a quick press. Either stick moves, A/B click, and the D-pad scrolls.";
+    _controllerPointerDetailLabel.textColor = [UIColor colorWithWhite:0.72 alpha:1.0];
+    _controllerPointerDetailLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleFootnote]
+        scaledFontForFont:[UIFont systemFontOfSize:13 weight:UIFontWeightRegular]];
+    _controllerPointerDetailLabel.adjustsFontForContentSizeCategory = YES;
+    _controllerPointerDetailLabel.numberOfLines = 0;
+    _controllerPointerDetailLabel.accessibilityIdentifier = @"settings.controllerPointerHint";
+    [self.scrollView addSubview:_controllerPointerDetailLabel];
+#endif
     
     DataManager* dataMan = [[DataManager alloc] init];
     TemporarySettings* currentSettings = [dataMan getSettings];
@@ -140,24 +328,23 @@ BOOL isCustomResolution(CGSize res) {
     // Ensure we pick a bitrate that falls exactly onto a slider notch
     _bitrate = bitrateTable[[self getSliderValueForBitrate:[currentSettings.bitrate intValue]]];
 
-    // Get the size of the screen with and without safe area insets
-    UIWindow *window = UIApplication.sharedApplication.windows.firstObject;
-    CGFloat screenScale = window.screen.scale;
-    CGFloat safeAreaWidth = (window.frame.size.width - window.safeAreaInsets.left - window.safeAreaInsets.right) * screenScale;
-    CGFloat fullScreenWidth = window.frame.size.width * screenScale;
-    CGFloat fullScreenHeight = window.frame.size.height * screenScale;
-    
     self.resolutionDisplayView.layer.cornerRadius = 10;
     self.resolutionDisplayView.clipsToBounds = YES;
-    UITapGestureRecognizer *resolutionDisplayViewTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(resolutionDisplayViewTapped:)];
-    [self.resolutionDisplayView addGestureRecognizer:resolutionDisplayViewTap];
+    _resolutionHelpButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    _resolutionHelpButton.frame = self.resolutionDisplayView.bounds;
+    _resolutionHelpButton.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _resolutionHelpButton.backgroundColor = UIColor.clearColor;
+    _resolutionHelpButton.accessibilityLabel = @"Stream resolution";
+    _resolutionHelpButton.accessibilityHint = @"Opens help for custom resolutions";
+    _resolutionHelpButton.accessibilityIdentifier = @"settings.resolutionHelp";
+    [_resolutionHelpButton addTarget:self action:@selector(resolutionHelpButtonPressed) forControlEvents:UIControlEventPrimaryActionTriggered];
+    [self.resolutionDisplayView addSubview:_resolutionHelpButton];
     
     resolutionTable[0] = CGSizeMake(640, 360);
     resolutionTable[1] = CGSizeMake(1280, 720);
     resolutionTable[2] = CGSizeMake(1920, 1080);
     resolutionTable[3] = CGSizeMake(3840, 2160);
-    resolutionTable[4] = CGSizeMake(safeAreaWidth, fullScreenHeight);
-    resolutionTable[5] = CGSizeMake(fullScreenWidth, fullScreenHeight);
+    [self updateDisplayResolutionEntries];
     resolutionTable[6] = CGSizeMake([currentSettings.width integerValue], [currentSettings.height integerValue]); // custom initial value
     
     // Don't populate the custom entry unless we have a custom resolution
@@ -442,18 +629,27 @@ BOOL isCustomResolution(CGSize res) {
         [subview removeFromSuperview];
     }
     UILabel *label1 = [[UILabel alloc] init];
+    label1.isAccessibilityElement = NO;
     label1.text = @"Set PC/Game resolution: ";
     label1.font = [UIFont systemFontOfSize:fontSize];
     [label1 sizeToFit];
     label1.frame = CGRectMake(padding, (viewFrameHeight - label1.frame.size.height) / 2, label1.frame.size.width, label1.frame.size.height);
 
     UILabel *label2 = [[UILabel alloc] init];
+    label2.isAccessibilityElement = NO;
     label2.text = [NSString stringWithFormat:@"%ld x %ld", (long)width, (long)height];
     [label2 sizeToFit];
     label2.frame = CGRectMake(viewFrameWidth - label2.frame.size.width - padding, (viewFrameHeight - label2.frame.size.height) / 2, label2.frame.size.width, label2.frame.size.height);
 
     [self.resolutionDisplayView addSubview:label1];
     [self.resolutionDisplayView addSubview:label2];
+    _resolutionHelpButton.frame = self.resolutionDisplayView.bounds;
+    _resolutionHelpButton.accessibilityValue = [NSString stringWithFormat:@"%ld by %ld", (long)width, (long)height];
+    [self.resolutionDisplayView addSubview:_resolutionHelpButton];
+}
+
+- (void)resolutionHelpButtonPressed {
+    [self resolutionDisplayViewTapped:nil];
 }
 
 - (void) bitrateSliderMoved {
@@ -520,6 +716,11 @@ BOOL isCustomResolution(CGSize res) {
     }
 
     return resolutionTable[[self.resolutionSelector selectedSegmentIndex]].width;
+}
+
+- (void)controllerPointerPreferenceChanged:(UISegmentedControl *)sender {
+    [NSUserDefaults.standardUserDefaults setBool:sender.selectedSegmentIndex == 1
+                                          forKey:@"ControllerPointerModeEnabled"];
 }
 
 - (void) saveSettings {

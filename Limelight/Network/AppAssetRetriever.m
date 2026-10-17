@@ -27,7 +27,9 @@ static const int MAX_ATTEMPTS = 5;
         if (appAssetResp.data != nil) {
             NSString* boxArtPath = [AppAssetManager boxArtPathForApp:self.app];
             [[NSFileManager defaultManager] createDirectoryAtPath:[boxArtPath stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
-            [appAssetResp.data writeToFile:boxArtPath atomically:NO];
+            if (![appAssetResp.data writeToFile:boxArtPath atomically:YES]) {
+                Log(LOG_W, @"Failed to write box art atomically for %@", self.app.name);
+            }
             break;
         }
         

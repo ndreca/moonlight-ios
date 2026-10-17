@@ -53,7 +53,7 @@
         <!--Settings View Controller-->
         <scene sceneID="tWo-uo-hHg">
             <objects>
-                <viewController id="BsV-3c-455" customClass="SettingsViewController" sceneMemberID="viewController">
+                <viewController storyboardIdentifier="Settings" id="BsV-3c-455" customClass="SettingsViewController" sceneMemberID="viewController">
                     <layoutGuides>
                         <viewControllerLayoutGuide type="top" id="ef6-uF-5Hh"/>
                         <viewControllerLayoutGuide type="bottom" id="XvO-F3-j4u"/>
@@ -391,7 +391,7 @@
                     </layoutGuides>
                     <view key="view" multipleTouchEnabled="YES" contentMode="scaleToFill" id="SMn-1j-R3I">
                         <rect key="frame" x="0.0" y="0.0" width="834" height="1194"/>
-                        <autoresizingMask key="autoresizingMask" flexibleMaxX="YES" flexibleMaxY="YES"/>
+                        <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
                         <color key="backgroundColor" red="0.3333357871" green="0.33332890269999998" blue="0.33333355190000002" alpha="1" colorSpace="custom" customColorSpace="displayP3"/>
                     </view>
                     <navigationItem key="navigationItem" id="iUf-9X-GeA"/>

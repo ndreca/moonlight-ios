@@ -7,6 +7,7 @@
 //
 
 #import "AbsoluteTouchHandler.h"
+#import "ControllerSupport.h"
 
 #include <Limelight.h>
 
@@ -22,10 +23,21 @@
 // How far the finger can move before it can override the double tap deadzone
 #define DOUBLE_TAP_DEAD_ZONE_DELTA 0.025f
 
+// Briefly defer absolute left-down so a near-simultaneous three-finger
+// keyboard gesture does not click the remote desktop on its first finger.
+#define MULTITOUCH_DISAMBIGUATION_DELAY 0.090f
+
 @implementation AbsoluteTouchHandler {
-    StreamView* view;
+    __weak StreamView* view;
     
     NSTimer* longPressTimer;
+    NSTimer* primaryPressTimer;
+    BOOL leftButtonPressed;
+    BOOL suppressCurrentTouch;
+    BOOL shouldRepositionOnPress;
+    BOOL longPressActivated;
+    BOOL clickPulseActive;
+    uint64_t clickPulseGeneration;
     UITouch* lastTouchDown;
     CGPoint lastTouchDownLocation;
     UITouch* lastTouchUp;
@@ -39,29 +51,67 @@
 }
 
 - (void)onLongPressStart:(NSTimer*)timer {
+    if (suppressCurrentTouch) {
+        return;
+    }
     // Raise the left click and start a right click
-    LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
-    LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_RIGHT);
+    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+    leftButtonPressed = NO;
+    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_PRESS, BUTTON_RIGHT);
+    longPressActivated = YES;
+}
+
+- (void)onPrimaryPressStart:(NSTimer*)timer {
+    primaryPressTimer = nil;
+    if (suppressCurrentTouch) {
+        return;
+    }
+    if (shouldRepositionOnPress) {
+        [view updateCursorLocation:lastTouchDownLocation isMouse:NO];
+    }
+    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_PRESS, BUTTON_LEFT);
+    leftButtonPressed = YES;
 }
 
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
+    if (clickPulseActive) {
+        clickPulseActive = NO;
+        clickPulseGeneration++;
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+    }
     // Ignore touch down events with more than one finger
     if ([[event allTouches] count] > 1) {
+        suppressCurrentTouch = YES;
+        if (leftButtonPressed) {
+            MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+            leftButtonPressed = NO;
+        }
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+        [primaryPressTimer invalidate];
+        primaryPressTimer = nil;
+        [longPressTimer invalidate];
+        longPressTimer = nil;
         return;
     }
+
+    suppressCurrentTouch = NO;
+    leftButtonPressed = NO;
+    longPressActivated = NO;
     
     UITouch* touch = [touches anyObject];
     CGPoint touchLocation = [touch locationInView:view];
     
-    // Don't reposition for finger down events within the deadzone. This makes double-clicking easier.
-    if (touch.timestamp - lastTouchUp.timestamp > DOUBLE_TAP_DEAD_ZONE_DELAY ||
+    // Defer cursor repositioning with left-down so a three-finger keyboard tap
+    // neither clicks nor moves the remote cursor.
+    shouldRepositionOnPress = touch.timestamp - lastTouchUp.timestamp > DOUBLE_TAP_DEAD_ZONE_DELAY ||
         sqrt(pow((touchLocation.x / view.bounds.size.width) - (lastTouchUpLocation.x / view.bounds.size.width), 2) +
-             pow((touchLocation.y / view.bounds.size.height) - (lastTouchUpLocation.y / view.bounds.size.height), 2)) > DOUBLE_TAP_DEAD_ZONE_DELTA) {
-        [view updateCursorLocation:touchLocation isMouse:NO];
-    }
+             pow((touchLocation.y / view.bounds.size.height) - (lastTouchUpLocation.y / view.bounds.size.height), 2)) > DOUBLE_TAP_DEAD_ZONE_DELTA;
     
-    // Press the left button down
-    LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
+    primaryPressTimer = [NSTimer scheduledTimerWithTimeInterval:MULTITOUCH_DISAMBIGUATION_DELAY
+                                                         target:self
+                                                       selector:@selector(onPrimaryPressStart:)
+                                                       userInfo:nil
+                                                        repeats:NO];
     
     // Start the long press timer
     longPressTimer = [NSTimer scheduledTimerWithTimeInterval:LONG_PRESS_ACTIVATION_DELAY
@@ -77,6 +127,16 @@
 - (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
     // Ignore touch move events with more than one finger
     if ([[event allTouches] count] > 1) {
+        suppressCurrentTouch = YES;
+        if (leftButtonPressed) {
+            MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+            leftButtonPressed = NO;
+        }
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+        [primaryPressTimer invalidate];
+        primaryPressTimer = nil;
+        [longPressTimer invalidate];
+        longPressTimer = nil;
         return;
     }
     
@@ -88,7 +148,20 @@
         // Moved too far since touch down. Cancel the long press timer.
         [longPressTimer invalidate];
         longPressTimer = nil;
+
+        if (!leftButtonPressed && primaryPressTimer != nil) {
+            [primaryPressTimer invalidate];
+            primaryPressTimer = nil;
+            [view updateCursorLocation:touchLocation isMouse:NO];
+            shouldRepositionOnPress = NO;
+            MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_PRESS, BUTTON_LEFT);
+            leftButtonPressed = YES;
+        }
     }
+
+    // The cursor has already followed this movement, so the delayed button-down
+    // must not snap it back to the original touch-down point.
+    shouldRepositionOnPress = NO;
     
     [view updateCursorLocation:[[touches anyObject] locationInView:view] isMouse:NO];
 }
@@ -99,12 +172,37 @@
         // Cancel the long press timer
         [longPressTimer invalidate];
         longPressTimer = nil;
+        [primaryPressTimer invalidate];
+        primaryPressTimer = nil;
 
-        // Left button up on finger up
-        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+        if (!suppressCurrentTouch) {
+            if (!leftButtonPressed && !longPressActivated) {
+                if (shouldRepositionOnPress) {
+                    [view updateCursorLocation:lastTouchDownLocation isMouse:NO];
+                }
+                MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_PRESS, BUTTON_LEFT);
+                uint64_t pulseGeneration = ++clickPulseGeneration;
+                clickPulseActive = YES;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(50 * NSEC_PER_MSEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (!self->clickPulseActive || self->clickPulseGeneration != pulseGeneration) {
+                        return;
+                    }
+                    self->clickPulseActive = NO;
+                    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+                });
+            }
+            else if (leftButtonPressed) {
+                MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+            }
+        }
+        leftButtonPressed = NO;
 
         // Raise right button too in case we triggered a long press gesture
-        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+        suppressCurrentTouch = NO;
+        shouldRepositionOnPress = NO;
+        longPressActivated = NO;
         
         // Remember this last touch for touch-down deadzoning
         lastTouchUp = [touches anyObject];
@@ -113,8 +211,23 @@
 }
 
 - (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
-    // Treat this as a normal touchesEnded event
-    [self touchesEnded:touches withEvent:event];
+    [self cancelAllTouches];
+}
+
+- (void)cancelAllTouches {
+    [primaryPressTimer invalidate];
+    primaryPressTimer = nil;
+    [longPressTimer invalidate];
+    longPressTimer = nil;
+    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceAbsoluteTouch, BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+    clickPulseActive = NO;
+    clickPulseGeneration++;
+    leftButtonPressed = NO;
+    suppressCurrentTouch = NO;
+    shouldRepositionOnPress = NO;
+    longPressActivated = NO;
+    lastTouchDown = nil;
 }
 
 @end

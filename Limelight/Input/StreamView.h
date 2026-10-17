@@ -18,10 +18,14 @@
 
 @end
 
+@protocol MoonlightTouchHandler <NSObject>
+- (void)cancelAllTouches;
+@end
+
 #if TARGET_OS_TV
 @interface StreamView : UIView <X1KitMouseDelegate, UITextFieldDelegate>
 #else
-@interface StreamView : UIView <X1KitMouseDelegate, UITextFieldDelegate, UIPointerInteractionDelegate>
+@interface StreamView : UIView <X1KitMouseDelegate, UITextFieldDelegate, UIPointerInteractionDelegate, UIGestureRecognizerDelegate>
 #endif
 
 - (void) setupStreamView:(ControllerSupport*)controllerSupport
@@ -29,6 +33,9 @@
                   config:(StreamConfiguration*)streamConfig;
 - (void) showOnScreenControls;
 - (OnScreenControlsLevel) getCurrentOscState;
+- (void) prepareForInactivity;
+- (void) resumeAfterInactivity;
+- (void) invalidateKeyboardSession;
 
 #if !TARGET_OS_TV
 - (void) updateCursorLocation:(CGPoint)location isMouse:(BOOL)isMouse;

@@ -22,6 +22,40 @@
 #define LONG_TIMEOUT_SEC 60
 #define EXTRA_LONG_TIMEOUT_SEC 180
 
+static SecCertificateRef CopySingleCertificateFromTrust(SecTrustRef trust) CF_RETURNS_RETAINED {
+    if (trust == nil) {
+        return nil;
+    }
+
+    if (@available(iOS 15.0, tvOS 15.0, *)) {
+        CFArrayRef certificateChain = SecTrustCopyCertificateChain(trust);
+        if (certificateChain == nil || CFArrayGetCount(certificateChain) != 1) {
+            if (certificateChain != nil) {
+                CFRelease(certificateChain);
+            }
+            return nil;
+        }
+        SecCertificateRef certificate = (SecCertificateRef)CFArrayGetValueAtIndex(certificateChain, 0);
+        if (certificate != nil) {
+            CFRetain(certificate);
+        }
+        CFRelease(certificateChain);
+        return certificate;
+    }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (SecTrustGetCertificateCount(trust) != 1) {
+        return nil;
+    }
+    SecCertificateRef certificate = SecTrustGetCertificateAtIndex(trust, 0);
+#pragma clang diagnostic pop
+    if (certificate != nil) {
+        CFRetain(certificate);
+    }
+    return certificate;
+}
+
 @implementation HttpManager {
     NSString* _urlSafeHostName;
     NSString* _baseHTTPURL;
@@ -31,6 +65,7 @@
     
     TemporaryHost *_host; // May be nil
     NSString* _baseHTTPSURL;
+    NSMutableSet<NSURLSession*>* _serverTrustRejectedSessions;
 }
 
 + (NSData*) fixXmlVersion:(NSData*) xmlData {
@@ -57,6 +92,7 @@
     _uniqueId = @"0123456789ABCDEF";
     _deviceName = deviceName;
     _serverCert = serverCert;
+    _serverTrustRejectedSessions = [[NSMutableSet alloc] init];
     
     NSString* address = [Utils addressPortStringToAddress:hostAddressPortString];
     unsigned short port = [Utils addressPortStringToPort:hostAddressPortString];
@@ -146,6 +182,12 @@
     
     dispatch_semaphore_wait(requestLock, DISPATCH_TIME_FOREVER);
     [urlSession invalidateAndCancel];
+
+    BOOL serverTrustRejected;
+    @synchronized(self) {
+        serverTrustRejected = [_serverTrustRejectedSessions containsObject:urlSession];
+        [_serverTrustRejectedSessions removeObject:urlSession];
+    }
     
     if (!respError && request.response) {
         [request.response populateWithData:requestResp];
@@ -159,11 +201,8 @@
             [self executeRequestSynchronously:request];
         }
     }
-    else if (respError && [respError code] == NSURLErrorServerCertificateUntrusted) {
-        // We must have a pinned cert for HTTPS. If we fail, it must be due to
-        // a non-matching cert, not because we had no cert at all.
-        assert(_serverCert != nil);
-        
+    else if (respError &&
+             (serverTrustRejected || [respError code] == NSURLErrorServerCertificateUntrusted)) {
         if (request.fallbackRequest) {
             // This will fall back to HTTP on serverinfo queries to allow us to pair again
             // and get the server cert updated.
@@ -172,6 +211,10 @@
             request.fallbackError = 0;
             request.fallbackRequest = NULL;
             [self executeRequestSynchronously:request];
+        }
+        else if (request.response) {
+            request.response.statusCode = [respError code];
+            request.response.statusMessage = [respError localizedDescription];
         }
     }
     else if (respError && request.response) {
@@ -315,36 +358,57 @@
 
 // Returns an array containing the certificate
 - (NSArray*)getCertificate:(SecIdentityRef) identity {
+    if (identity == nil) {
+        return nil;
+    }
+
     SecCertificateRef certificate = nil;
-    
-    SecIdentityCopyCertificate(identity, &certificate);
-    
+    OSStatus status = SecIdentityCopyCertificate(identity, &certificate);
+    if (status != errSecSuccess || certificate == nil) {
+        Log(LOG_E, @"Unable to copy client certificate from identity: %d", (int)status);
+        return nil;
+    }
+
     return [[NSArray alloc] initWithObjects:(__bridge_transfer id)certificate, nil];
 }
 
 // Returns the identity
 - (SecIdentityRef)getClientCertificate {
     SecIdentityRef identityApp = nil;
-    CFDataRef p12Data = (__bridge CFDataRef)[CryptoManager readP12FromFile];
+    NSData *p12FileData = [CryptoManager readP12FromFile];
+    if (p12FileData.length == 0) {
+        Log(LOG_E, @"Client certificate file is missing or empty");
+        return nil;
+    }
+    CFDataRef p12Data = (__bridge CFDataRef)p12FileData;
 
     CFStringRef password = CFSTR("limelight");
     const void *keys[] = { kSecImportExportPassphrase };
     const void *values[] = { password };
     CFDictionaryRef options = CFDictionaryCreate(NULL, keys, values, 1, NULL, NULL);
     CFArrayRef items = nil;
-    OSStatus securityError = SecPKCS12Import(p12Data, options, &items);
+    OSStatus securityError = options != nil ? SecPKCS12Import(p12Data, options, &items) : errSecAllocate;
 
-    if (securityError == errSecSuccess) {
-        //Log(LOG_D, @"Success opening p12 certificate. Items: %ld", CFArrayGetCount(items));
+    if (securityError == errSecSuccess && items != nil && CFArrayGetCount(items) > 0) {
         CFDictionaryRef identityDict = CFArrayGetValueAtIndex(items, 0);
-        identityApp = (SecIdentityRef)CFRetain(CFDictionaryGetValue(identityDict, kSecImportItemIdentity));
-        CFRelease(items);
+        SecIdentityRef importedIdentity =
+            identityDict != nil ? (SecIdentityRef)CFDictionaryGetValue(identityDict, kSecImportItemIdentity) : nil;
+        if (importedIdentity != nil) {
+            identityApp = (SecIdentityRef)CFRetain(importedIdentity);
+        }
+        else {
+            Log(LOG_E, @"PKCS#12 import did not contain a client identity");
+        }
     } else {
-        Log(LOG_E, @"Error opening Certificate.");
+        Log(LOG_E, @"Error opening client certificate: %d", (int)securityError);
     }
-    
-    CFRelease(options);
-    CFRelease(password);
+
+    if (items != nil) {
+        CFRelease(items);
+    }
+    if (options != nil) {
+        CFRelease(options);
+    }
     
     return identityApp;
 }
@@ -353,30 +417,43 @@
     // Allow untrusted server certificates
     if([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust])
     {
-        if (SecTrustGetCertificateCount(challenge.protectionSpace.serverTrust) != 1) {
-            Log(LOG_E, @"Server certificate count mismatch");
-            completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, NULL);
+        if (_serverCert.length == 0) {
+            Log(LOG_E, @"Pinned server certificate is missing");
+            @synchronized(self) {
+                [_serverTrustRejectedSessions addObject:session];
+            }
+            completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
             return;
         }
-        
-        SecCertificateRef actualCert = SecTrustGetCertificateAtIndex(challenge.protectionSpace.serverTrust, 0);
+
+        SecCertificateRef actualCert = CopySingleCertificateFromTrust(challenge.protectionSpace.serverTrust);
         if (actualCert == nil) {
-            Log(LOG_E, @"Server certificate parsing error");
-            completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, NULL);
+            Log(LOG_E, @"Server certificate count or parsing mismatch");
+            @synchronized(self) {
+                [_serverTrustRejectedSessions addObject:session];
+            }
+            completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
             return;
         }
         
         CFDataRef actualCertData = SecCertificateCopyData(actualCert);
+        CFRelease(actualCert);
         if (actualCertData == nil) {
             Log(LOG_E, @"Server certificate data parsing error");
-            completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, NULL);
+            @synchronized(self) {
+                [_serverTrustRejectedSessions addObject:session];
+            }
+            completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
             return;
         }
         
         if (!CFEqual(actualCertData, (__bridge CFDataRef)_serverCert)) {
             Log(LOG_E, @"Server certificate mismatch");
             CFRelease(actualCertData);
-            completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, NULL);
+            @synchronized(self) {
+                [_serverTrustRejectedSessions addObject:session];
+            }
+            completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
             return;
         }
         
@@ -391,6 +468,14 @@
     {
         SecIdentityRef identity = [self getClientCertificate];
         NSArray* certArray = [self getCertificate:identity];
+        if (identity == nil || certArray.count == 0) {
+            Log(LOG_E, @"Unable to answer client certificate challenge");
+            if (identity != nil) {
+                CFRelease(identity);
+            }
+            completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
+            return;
+        }
         NSURLCredential* newCredential = [NSURLCredential credentialWithIdentity:identity certificates:certArray persistence:NSURLCredentialPersistencePermanent];
         CFRelease(identity);
         completionHandler(NSURLSessionAuthChallengeUseCredential, newCredential);

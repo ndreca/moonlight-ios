@@ -7,6 +7,7 @@
 //
 
 #import "RelativeTouchHandler.h"
+#import "ControllerSupport.h"
 
 #include <Limelight.h>
 
@@ -25,7 +26,7 @@ static const int REFERENCE_HEIGHT = 720;
     UIGestureRecognizer* remoteLongPressRecognizer;
 #endif
     
-    UIView* view;
+    __weak UIView* view;
 }
 
 - (id)initWithView:(StreamView*)view {
@@ -54,7 +55,7 @@ static const int REFERENCE_HEIGHT = 720;
 - (void)onDragStart:(NSTimer*)timer {
     if (!touchMoved && !isDragging){
         isDragging = true;
-        LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_PRESS, BUTTON_LEFT);
     }
 }
 
@@ -126,31 +127,31 @@ static const int REFERENCE_HEIGHT = 720;
     dragTimer = nil;
     if (isDragging) {
         isDragging = false;
-        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
     } else if (!touchMoved) {
         if (peakTouchCount == 2) {
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
                 Log(LOG_D, @"Sending right mouse button press");
                 
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_RIGHT);
+                MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_PRESS, BUTTON_RIGHT);
                 
                 // Wait 100 ms to simulate a real button press
                 usleep(100 * 1000);
                 
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+                MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
             });
         } else if (peakTouchCount == 1) {
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
                 if (!self->isDragging){
                     Log(LOG_D, @"Sending left mouse button press");
                     
-                    LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
+                    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_PRESS, BUTTON_LEFT);
                     
                     // Wait 100 ms to simulate a real button press
                     usleep(100 * 1000);
                 }
                 self->isDragging = false;
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+                MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
             });
         }
     }
@@ -171,13 +172,17 @@ static const int REFERENCE_HEIGHT = 720;
 }
 
 - (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
+    [self cancelAllTouches];
+}
+
+- (void)cancelAllTouches {
     [dragTimer invalidate];
     dragTimer = nil;
-    if (isDragging) {
-        isDragging = false;
-        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
-    }
+    isDragging = false;
+    touchMoved = true;
     peakTouchCount = 0;
+    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
 }
 
 #if TARGET_OS_TV
@@ -188,19 +193,19 @@ static const int REFERENCE_HEIGHT = 720;
         // Mark this as touchMoved to avoid a duplicate press on touch up
         self->touchMoved = true;
         
-        LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_PRESS, BUTTON_LEFT);
         
         // Wait 100 ms to simulate a real button press
         usleep(100 * 1000);
             
-        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+        MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_RELEASE, BUTTON_LEFT);
     });
 }
 - (void)remoteButtonLongPressed:(id)sender {
     Log(LOG_D, @"Holding left mouse button");
     
     isDragging = true;
-    LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
+    MoonlightSendMouseButtonEvent(MoonlightMouseButtonSourceRelativeTouch, BUTTON_ACTION_PRESS, BUTTON_LEFT);
 }
 #endif
 

@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <Limelight.h>
+#include <stdatomic.h>
 
 #if TARGET_OS_TV
 #import <AVFoundation/AVDisplayCriteria.h>
@@ -28,6 +29,12 @@
 @property(readonly) int videoDynamicRange;
 @property(readonly, nonatomic) float refreshRate;
 - (id)initWithRefreshRate:(float)arg1 videoDynamicRange:(int)arg2;
+@end
+
+@interface StreamFrameViewController ()
+- (void)prepareForTerminalStreamStop;
+- (void)stopStreamSafely;
+- (void)completeBackgroundStreamShutdown;
 @end
 
 @implementation StreamFrameViewController {
@@ -42,15 +49,28 @@
     UITextView *_overlayView;
     UILabel *_stageLabel;
     UILabel *_tipLabel;
+    UILabel *_modeToastLabel;
     UIActivityIndicatorView *_spinner;
     StreamView *_streamView;
     UIScrollView *_scrollView;
     BOOL _userIsInteracting;
+    _Atomic(bool) _terminalInputPrepared;
+    _Atomic(bool) _backgroundShutdownStarted;
     CGSize _keyboardSize;
     
 #if !TARGET_OS_TV
     UIScreenEdgePanGestureRecognizer *_exitSwipeRecognizer;
+    UIBackgroundTaskIdentifier _backgroundShutdownTask;
 #endif
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+
+    // The navigation bar changes the container's layout geometry. Hide it without
+    // animation before this controller's first layout pass so streaming is full bleed.
+    [self.navigationController setNavigationBarHidden:YES animated:NO];
 }
 
 - (void)viewDidAppear:(BOOL)animated
@@ -78,8 +98,19 @@
 - (void)viewDidLoad
 {
     [super viewDidLoad];
-    
-    [self.navigationController setNavigationBarHidden:YES animated:YES];
+
+    atomic_init(&_terminalInputPrepared, false);
+    atomic_init(&_backgroundShutdownStarted, false);
+#if !TARGET_OS_TV
+    _backgroundShutdownTask = UIBackgroundTaskInvalid;
+#endif
+
+    [self.navigationController setNavigationBarHidden:YES animated:NO];
+    self.edgesForExtendedLayout = UIRectEdgeAll;
+    self.extendedLayoutIncludesOpaqueBars = YES;
+    self.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.view.backgroundColor = [UIColor blackColor];
+    self.view.clipsToBounds = YES;
     
     [UIApplication sharedApplication].idleTimerDisabled = YES;
     
@@ -88,26 +119,34 @@
     _stageLabel = [[UILabel alloc] init];
     [_stageLabel setUserInteractionEnabled:NO];
     [_stageLabel setText:[NSString stringWithFormat:@"Starting %@...", self.streamConfig.appName]];
-    [_stageLabel sizeToFit];
+    _stageLabel.numberOfLines = 0;
     _stageLabel.textAlignment = NSTextAlignmentCenter;
     _stageLabel.textColor = [UIColor whiteColor];
-    _stageLabel.center = CGPointMake(self.view.frame.size.width / 2, self.view.frame.size.height / 2);
+#if TARGET_OS_TV
+    _stageLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleTitle1]
+        scaledFontForFont:[UIFont systemFontOfSize:38 weight:UIFontWeightSemibold]];
+#else
+    _stageLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+#endif
+    _stageLabel.adjustsFontForContentSizeCategory = YES;
     
     _spinner = [[UIActivityIndicatorView alloc] init];
     [_spinner setUserInteractionEnabled:NO];
 #if TARGET_OS_TV
-    [_spinner setActivityIndicatorViewStyle:UIActivityIndicatorViewStyleWhiteLarge];
+    [_spinner setActivityIndicatorViewStyle:UIActivityIndicatorViewStyleLarge];
 #else
-    [_spinner setActivityIndicatorViewStyle:UIActivityIndicatorViewStyleWhite];
+    [_spinner setActivityIndicatorViewStyle:UIActivityIndicatorViewStyleMedium];
 #endif
+    _spinner.color = [UIColor whiteColor];
     [_spinner sizeToFit];
     [_spinner startAnimating];
-    _spinner.center = CGPointMake(self.view.frame.size.width / 2, self.view.frame.size.height / 2 - _stageLabel.frame.size.height - _spinner.frame.size.height);
     
     _controllerSupport = [[ControllerSupport alloc] initWithConfig:self.streamConfig delegate:self];
     _inactivityTimer = nil;
     
-    _streamView = [[StreamView alloc] initWithFrame:self.view.frame];
+    _streamView = [[StreamView alloc] initWithFrame:self.view.bounds];
+    _streamView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _streamView.backgroundColor = [UIColor blackColor];
     [_streamView setupStreamView:_controllerSupport interactionDelegate:self config:self.streamConfig];
     
 #if TARGET_OS_TV
@@ -143,14 +182,38 @@
 #if TARGET_OS_TV
     [_tipLabel setText:@"Tip: Tap the Play/Pause button on the Apple TV Remote to disconnect from your PC"];
 #else
-    [_tipLabel setText:@"Tip: Swipe from the left edge to disconnect from your PC"];
+    [_tipLabel setText:@"Tip: Swipe from the left edge to disconnect · Three-finger tap for keyboard"];
 #endif
     
     [_tipLabel sizeToFit];
+    _tipLabel.numberOfLines = 0;
     _tipLabel.textColor = [UIColor whiteColor];
     _tipLabel.textAlignment = NSTextAlignmentCenter;
-    _tipLabel.center = CGPointMake(self.view.frame.size.width / 2, self.view.frame.size.height * 0.9);
-    
+#if TARGET_OS_TV
+    _tipLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleTitle3]
+        scaledFontForFont:[UIFont systemFontOfSize:28 weight:UIFontWeightRegular]];
+#else
+    _tipLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+#endif
+    _tipLabel.adjustsFontForContentSizeCategory = YES;
+
+    _modeToastLabel = [[UILabel alloc] init];
+    _modeToastLabel.hidden = YES;
+    _modeToastLabel.numberOfLines = 0;
+    _modeToastLabel.textAlignment = NSTextAlignmentCenter;
+    _modeToastLabel.textColor = UIColor.whiteColor;
+    _modeToastLabel.backgroundColor = [UIColor colorWithWhite:0.04 alpha:0.86];
+#if TARGET_OS_TV
+    _modeToastLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleTitle2]
+        scaledFontForFont:[UIFont systemFontOfSize:30 weight:UIFontWeightSemibold]];
+    _modeToastLabel.layer.cornerRadius = 20.0;
+#else
+    _modeToastLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    _modeToastLabel.layer.cornerRadius = 12.0;
+#endif
+    _modeToastLabel.layer.cornerCurve = kCACornerCurveContinuous;
+    _modeToastLabel.layer.masksToBounds = YES;
+
     _streamMan = [[StreamManager alloc] initWithConfig:self.streamConfig
                                             renderView:_streamView
                                    connectionCallbacks:self];
@@ -172,6 +235,16 @@
                                                  name: UIApplicationDidEnterBackgroundNotification
                                                object: nil];
 
+    if (@available(iOS 13.0, tvOS 13.0, *)) {
+        // Scene-based apps may transition the active window scene before the
+        // legacy application notification reaches this controller. Observe
+        // both; the shutdown path is atomic and idempotent.
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(applicationDidEnterBackground:)
+                                                     name:UISceneDidEnterBackgroundNotification
+                                                   object:nil];
+    }
+
 #if 0
     // FIXME: This doesn't work reliably on iPad for some reason. Showing and hiding the keyboard
     // several times in a row will not correctly restore the state of the UIScrollView.
@@ -188,7 +261,9 @@
     
     // Only enable scroll and zoom in absolute touch mode
     if (_settings.absoluteTouchMode) {
-        _scrollView = [[UIScrollView alloc] initWithFrame:self.view.frame];
+        _scrollView = [[UIScrollView alloc] initWithFrame:self.view.bounds];
+        _scrollView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _scrollView.backgroundColor = [UIColor blackColor];
 #if !TARGET_OS_TV
         [_scrollView.panGestureRecognizer setMinimumNumberOfTouches:2];
 #endif
@@ -196,6 +271,11 @@
         [_scrollView setShowsVerticalScrollIndicator:NO];
         [_scrollView setDelegate:self];
         [_scrollView setMaximumZoomScale:10.0f];
+        _scrollView.contentInset = UIEdgeInsetsZero;
+        _scrollView.scrollIndicatorInsets = UIEdgeInsetsZero;
+        if (@available(iOS 11.0, tvOS 11.0, *)) {
+            _scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+        }
         
         // Add StreamView inside a UIScrollView for absolute mode
         [_scrollView addSubview:_streamView];
@@ -209,6 +289,108 @@
     [self.view addSubview:_stageLabel];
     [self.view addSubview:_spinner];
     [self.view addSubview:_tipLabel];
+    [self.view addSubview:_modeToastLabel];
+
+    [self.view setNeedsLayout];
+}
+
+- (void)layoutLoadingViews
+{
+    CGRect bounds = self.view.bounds;
+    CGFloat maximumLabelWidth = MAX(0.0, CGRectGetWidth(bounds) - 32.0);
+
+    CGSize stageSize = [_stageLabel sizeThatFits:CGSizeMake(maximumLabelWidth, CGFLOAT_MAX)];
+    stageSize.width = MIN(maximumLabelWidth, stageSize.width);
+    _stageLabel.bounds = (CGRect){ CGPointZero, stageSize };
+    _stageLabel.center = CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds));
+
+    [_spinner sizeToFit];
+    _spinner.center = CGPointMake(CGRectGetMidX(bounds),
+                                  CGRectGetMinY(_stageLabel.frame) - 12.0 - CGRectGetHeight(_spinner.bounds) / 2.0);
+
+    CGSize tipSize = [_tipLabel sizeThatFits:CGSizeMake(maximumLabelWidth, CGFLOAT_MAX)];
+    tipSize.width = MIN(maximumLabelWidth, tipSize.width);
+    _tipLabel.bounds = (CGRect){ CGPointZero, tipSize };
+    _tipLabel.center = CGPointMake(CGRectGetMidX(bounds),
+                                   CGRectGetMinY(bounds) + CGRectGetHeight(bounds) * 0.9);
+}
+
+- (void)layoutOverlayView
+{
+    if (_overlayView == nil) {
+        return;
+    }
+
+    CGRect bounds = self.view.bounds;
+    CGFloat maximumWidth = MAX(0.0, CGRectGetWidth(bounds));
+
+    // Constrain measurement to the current root bounds on every layout pass. This
+    // also preserves the existing workaround for UITextView line-break shrinkage.
+    _overlayView.bounds = CGRectMake(0, 0, maximumWidth, CGRectGetHeight(_overlayView.bounds));
+    CGSize overlaySize = [_overlayView sizeThatFits:CGSizeMake(maximumWidth, CGFLOAT_MAX)];
+    overlaySize.width = MIN(maximumWidth, overlaySize.width);
+    _overlayView.frame = CGRectIntegral(CGRectMake(CGRectGetMidX(bounds) - overlaySize.width / 2.0,
+                                                   CGRectGetMinY(bounds),
+                                                   overlaySize.width,
+                                                   overlaySize.height));
+}
+
+- (void)viewDidLayoutSubviews
+{
+    [super viewDidLayoutSubviews];
+
+    CGRect rootBounds = self.view.bounds;
+    if (_scrollView != nil) {
+        _scrollView.frame = rootBounds;
+
+        // Avoid disturbing an intentional zoom transform during a container resize.
+        if (ABS(_scrollView.zoomScale - _scrollView.minimumZoomScale) < 0.001) {
+            _streamView.frame = CGRectMake(0, 0,
+                                           CGRectGetWidth(_scrollView.bounds),
+                                           CGRectGetHeight(_scrollView.bounds));
+            _scrollView.contentSize = _streamView.bounds.size;
+        }
+    }
+    else {
+        _streamView.frame = rootBounds;
+    }
+
+    [_streamView setNeedsLayout];
+    [_streamView layoutIfNeeded];
+    [VideoDecoderRenderer updateLayoutForView:_streamView];
+
+    [self layoutLoadingViews];
+    [self layoutOverlayView];
+
+    UIEdgeInsets safeAreaInsets = self.view.safeAreaInsets;
+    CGFloat maximumToastWidth = TARGET_OS_TV ? 1100.0 : 560.0;
+    CGFloat toastHorizontalPadding = TARGET_OS_TV ? 52.0 : 28.0;
+    CGFloat toastVerticalPadding = TARGET_OS_TV ? 30.0 : 18.0;
+    CGFloat availableToastWidth = MIN(maximumToastWidth, CGRectGetWidth(rootBounds) - safeAreaInsets.left - safeAreaInsets.right - 32.0);
+    CGSize toastSize = [_modeToastLabel sizeThatFits:CGSizeMake(availableToastWidth, CGFLOAT_MAX)];
+    toastSize.width = MIN(availableToastWidth, toastSize.width + toastHorizontalPadding);
+    toastSize.height += toastVerticalPadding;
+    _modeToastLabel.frame = CGRectIntegral(CGRectMake(CGRectGetMidX(rootBounds) - toastSize.width * 0.5,
+                                                      CGRectGetMaxY(rootBounds) - safeAreaInsets.bottom - toastSize.height - 18.0,
+                                                      toastSize.width,
+                                                      toastSize.height));
+
+}
+
+- (void)showModeToast:(NSString *)message {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self->_modeToastLabel.text = message;
+        self->_modeToastLabel.hidden = NO;
+        [self.view setNeedsLayout];
+        UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, message);
+
+        NSString *messageToken = [message copy];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if ([self->_modeToastLabel.text isEqualToString:messageToken]) {
+                self->_modeToastLabel.hidden = YES;
+            }
+        });
+    });
 }
 
 - (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
@@ -218,15 +400,74 @@
 - (void)willMoveToParentViewController:(UIViewController *)parent {
     // Only cleanup when we're being destroyed
     if (parent == nil) {
-        [_controllerSupport cleanup];
+        [self stopStreamSafely];
         [UIApplication sharedApplication].idleTimerDisabled = NO;
-        [_streamMan stopStream];
         if (_inactivityTimer != nil) {
             [_inactivityTimer invalidate];
             _inactivityTimer = nil;
         }
         [[NSNotificationCenter defaultCenter] removeObserver:self];
     }
+}
+
+- (void)dealloc {
+    [_statsUpdateTimer invalidate];
+    _statsUpdateTimer = nil;
+    [_streamView invalidateKeyboardSession];
+    [_controllerSupport cleanup];
+    [_streamMan stopStream];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)prepareForTerminalStreamStop {
+    void (^prepare)(void) = ^{
+        if (atomic_exchange_explicit(&self->_terminalInputPrepared, true, memory_order_acq_rel)) {
+            return;
+        }
+
+        // These timers and input callbacks can call into moonlight-common.
+        // Drain and permanently disable them on the main thread before the C
+        // connection destroys its queues and mutexes.
+        [self->_statsUpdateTimer invalidate];
+        self->_statsUpdateTimer = nil;
+        [self->_inactivityTimer invalidate];
+        self->_inactivityTimer = nil;
+        [self->_streamView invalidateKeyboardSession];
+        [self->_controllerSupport cleanup];
+    };
+
+    if (NSThread.isMainThread) {
+        prepare();
+    }
+    else {
+        dispatch_sync(dispatch_get_main_queue(), prepare);
+    }
+}
+
+- (void)stopStreamSafely {
+    [self prepareForTerminalStreamStop];
+    [_streamMan stopStream];
+}
+
+- (void)completeBackgroundStreamShutdown {
+#if !TARGET_OS_TV
+    void (^complete)(void) = ^{
+        if (self->_backgroundShutdownTask == UIBackgroundTaskInvalid) {
+            return;
+        }
+
+        UIBackgroundTaskIdentifier task = self->_backgroundShutdownTask;
+        self->_backgroundShutdownTask = UIBackgroundTaskInvalid;
+        [[UIApplication sharedApplication] endBackgroundTask:task];
+    };
+
+    if (NSThread.isMainThread) {
+        complete();
+    }
+    else {
+        dispatch_async(dispatch_get_main_queue(), complete);
+    }
+#endif
 }
 
 #if 0
@@ -254,6 +495,9 @@
 #endif
 
 - (void)updateStatsOverlay {
+    if (atomic_load_explicit(&_terminalInputPrepared, memory_order_acquire)) {
+        return;
+    }
     NSString* overlayText = [self->_streamMan getStatsOverlayText];
     
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -288,16 +532,8 @@
     }
     
     if (text != nil) {
-        // We set our bounds to the maximum width in order to work around a bug where
-        // sizeToFit interacts badly with the UITextView's line breaks, causing the
-        // width to get smaller and smaller each time as more line breaks are inserted.
-        [_overlayView setBounds:CGRectMake(self.view.frame.origin.x,
-                                           _overlayView.frame.origin.y,
-                                           self.view.frame.size.width,
-                                           _overlayView.frame.size.height)];
         [_overlayView setText:text];
-        [_overlayView sizeToFit];
-        [_overlayView setCenter:CGPointMake(self.view.frame.size.width / 2, _overlayView.frame.size.height / 2)];
+        [self layoutOverlayView];
         [_overlayView setHidden:NO];
     }
     else {
@@ -308,15 +544,15 @@
 - (void) returnToMainFrame {
     // Reset display mode back to default
     [self updatePreferredDisplayMode:NO];
-    
-    [_statsUpdateTimer invalidate];
-    _statsUpdateTimer = nil;
+
+    [self stopStreamSafely];
     
     [self.navigationController popToRootViewControllerAnimated:YES];
 }
 
 // This will fire if the user opens control center or gets a low battery message
 - (void)applicationWillResignActive:(NSNotification *)notification {
+    [_streamView prepareForInactivity];
     if (_inactivityTimer != nil) {
         [_inactivityTimer invalidate];
     }
@@ -341,6 +577,15 @@
 }
 
 - (void)applicationDidBecomeActive:(NSNotification *)notification {
+    if (atomic_load_explicit(&_terminalInputPrepared, memory_order_acquire)) {
+        return;
+    }
+    [_streamView resumeAfterInactivity];
+#if !TARGET_OS_TV
+    if (@available(iOS 14.0, *)) {
+        [self setNeedsUpdateOfPrefersPointerLocked];
+    }
+#endif
     // Stop the background timer, since we're foregrounded again
     if (_inactivityTimer != nil) {
         Log(LOG_I, @"Stopping inactivity timer after becoming active again");
@@ -349,16 +594,43 @@
     }
 }
 
-// This fires when the home button is pressed
-- (void)applicationDidEnterBackground:(UIApplication *)application {
+// This fires when the app or its active scene enters the background.
+- (void)applicationDidEnterBackground:(NSNotification *)notification {
+    if (atomic_exchange_explicit(&_backgroundShutdownStarted, true, memory_order_acq_rel)) {
+        return;
+    }
+
     Log(LOG_I, @"Terminating stream immediately for backgrounding");
 
     if (_inactivityTimer != nil) {
         [_inactivityTimer invalidate];
         _inactivityTimer = nil;
     }
-    
+
+#if !TARGET_OS_TV
+    UIApplication *application = UIApplication.sharedApplication;
+    __weak StreamFrameViewController *weakSelf = self;
+    _backgroundShutdownTask = [application beginBackgroundTaskWithName:@"Moonlight Stream Teardown"
+                                                     expirationHandler:^{
+        StreamFrameViewController *strongSelf = weakSelf;
+        Log(LOG_W, @"Background stream teardown time expired");
+        [strongSelf completeBackgroundStreamShutdown];
+    }];
+
+    // Keep the host application running, but fully close the streaming
+    // connection before iOS suspends this process. Otherwise a half-finished
+    // teardown can collide with the next Sunshine portal capture session.
+    [self updatePreferredDisplayMode:NO];
+    [self prepareForTerminalStreamStop];
+    [_streamMan stopStreamWithCompletion:^{
+        Log(LOG_I, @"Background stream teardown completed");
+        [self completeBackgroundStreamShutdown];
+    }];
+    [UIApplication sharedApplication].idleTimerDisabled = NO;
+    [self.navigationController popToRootViewControllerAnimated:NO];
+#else
     [self returnToMainFrame];
+#endif
 }
 
 - (void)edgeSwiped {
@@ -370,6 +642,9 @@
 - (void) connectionStarted {
     Log(LOG_I, @"Connection started");
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (atomic_load_explicit(&self->_terminalInputPrepared, memory_order_acquire)) {
+            return;
+        }
         // Leave the spinner spinning until it's obscured by
         // the first frame of video.
         self->_stageLabel.hidden = YES;
@@ -377,8 +652,19 @@
         
         [self->_streamView showOnScreenControls];
         
+#if !TARGET_OS_TV
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        if (![defaults boolForKey:@"DidShowStreamGestureHint"]) {
+            [defaults setBool:YES forKey:@"DidShowStreamGestureHint"];
+            [self showModeToast:@"Three-finger tap for keyboard · Swipe from the left edge to disconnect"];
+        }
+#endif
+
+        // Pointer-mode notifications should be the final onboarding message so
+        // the generic gesture hint cannot hide an automatically enabled Desktop
+        // mouse-mode toast.
         [self->_controllerSupport connectionEstablished];
-        
+
         if (self->_settings.statsOverlay) {
             self->_statsUpdateTimer = [NSTimer scheduledTimerWithTimeInterval:1.0f
                                                                        target:self
@@ -391,6 +677,11 @@
 
 - (void)connectionTerminated:(int)errorCode {
     Log(LOG_I, @"Connection terminated: %d", errorCode);
+
+    // Stop all Objective-C input and stats producers before common tears down
+    // its process-global stream state. This also drains any main-run-loop
+    // controller pointer callback that was already in flight.
+    [self prepareForTerminalStreamStop];
     
     unsigned int portFlags = LiGetPortFlagsFromTerminationErrorCode(errorCode);
     unsigned int portTestResults = LiTestClientConnectivity(CONN_TEST_SERVER, 443, portFlags);
@@ -476,8 +767,7 @@
         NSString* lowerCase = [NSString stringWithFormat:@"%s in progress...", stageName];
         NSString* titleCase = [[[lowerCase substringToIndex:1] uppercaseString] stringByAppendingString:[lowerCase substringFromIndex:1]];
         [self->_stageLabel setText:titleCase];
-        [self->_stageLabel sizeToFit];
-        self->_stageLabel.center = CGPointMake(self.view.frame.size.width / 2, self->_stageLabel.center.y);
+        [self layoutLoadingViews];
     });
 }
 
@@ -486,6 +776,8 @@
 
 - (void) stageFailed:(const char*)stageName withError:(int)errorCode portTestFlags:(int)portTestFlags {
     Log(LOG_I, @"Stage %s failed: %d", stageName, errorCode);
+
+    [self prepareForTerminalStreamStop];
     
     unsigned int portTestResults = LiTestClientConnectivity(CONN_TEST_SERVER, 443, portTestFlags);
 
@@ -535,30 +827,45 @@
 }
 
 - (void)rumble:(unsigned short)controllerNumber lowFreqMotor:(unsigned short)lowFreqMotor highFreqMotor:(unsigned short)highFreqMotor {
+    if (atomic_load_explicit(&_terminalInputPrepared, memory_order_acquire)) {
+        return;
+    }
     Log(LOG_I, @"Rumble on gamepad %d: %04x %04x", controllerNumber, lowFreqMotor, highFreqMotor);
     
     [_controllerSupport rumble:controllerNumber lowFreqMotor:lowFreqMotor highFreqMotor:highFreqMotor];
 }
 
 - (void) rumbleTriggers:(uint16_t)controllerNumber leftTrigger:(uint16_t)leftTrigger rightTrigger:(uint16_t)rightTrigger {
+    if (atomic_load_explicit(&_terminalInputPrepared, memory_order_acquire)) {
+        return;
+    }
     Log(LOG_I, @"Trigger rumble on gamepad %d: %04x %04x", controllerNumber, leftTrigger, rightTrigger);
     
     [_controllerSupport rumbleTriggers:controllerNumber leftTrigger:leftTrigger rightTrigger:rightTrigger];
 }
 
 - (void) setMotionEventState:(uint16_t)controllerNumber motionType:(uint8_t)motionType reportRateHz:(uint16_t)reportRateHz {
+    if (atomic_load_explicit(&_terminalInputPrepared, memory_order_acquire)) {
+        return;
+    }
     Log(LOG_I, @"Set motion state on gamepad %d: %02x %u Hz", controllerNumber, motionType, reportRateHz);
     
     [_controllerSupport setMotionEventState:controllerNumber motionType:motionType reportRateHz:reportRateHz];
 }
 
 - (void) setControllerLed:(uint16_t)controllerNumber r:(uint8_t)r g:(uint8_t)g b:(uint8_t)b {
+    if (atomic_load_explicit(&_terminalInputPrepared, memory_order_acquire)) {
+        return;
+    }
     Log(LOG_I, @"Set controller LED on gamepad %d: l%02x%02x%02x", controllerNumber, r, g, b);
     
     [_controllerSupport setControllerLed:controllerNumber r:r g:g b:b];
 }
 
 - (void)connectionStatusUpdate:(int)status {
+    if (atomic_load_explicit(&_terminalInputPrepared, memory_order_acquire)) {
+        return;
+    }
     Log(LOG_W, @"Connection status update: %d", status);
 
     // The stats overlay takes precedence over these warnings
@@ -567,6 +874,9 @@
     }
     
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (atomic_load_explicit(&self->_terminalInputPrepared, memory_order_acquire)) {
+            return;
+        }
         switch (status) {
             case CONN_STATUS_OKAY:
                 [self updateOverlayText:nil];
@@ -639,6 +949,19 @@
 #endif
 }
 
+- (void)controllerPointerModeChanged:(BOOL)enabled playerIndex:(NSInteger)playerIndex {
+#if !TARGET_OS_TV
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [feedback impactOccurred];
+#endif
+    if (enabled) {
+        [self showModeToast:@"Controller pointer on · sticks move · A/B click · D-pad scroll · hold Menu to exit"];
+    }
+    else {
+        [self showModeToast:@"Controller pointer off"];
+    }
+}
+
 - (void)mousePresenceChanged {
 #if !TARGET_OS_TV
     if (@available(iOS 14.0, *)) {
@@ -678,36 +1001,26 @@
 
 #if !TARGET_OS_TV
 // Require a confirmation when streaming to activate a system gesture
+- (BOOL)prefersStatusBarHidden {
+    return YES;
+}
+
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures {
     return UIRectEdgeAll;
 }
 
 - (BOOL)prefersHomeIndicatorAutoHidden {
-    if ([_controllerSupport getConnectedGamepadCount] > 0 &&
-        [_streamView getCurrentOscState] == OnScreenControlsLevelOff &&
-        _userIsInteracting == NO) {
-        // Autohide the home bar when a gamepad is connected
-        // and the on-screen controls are disabled. We can't
-        // do this all the time because any touch on the display
-        // will cause the home indicator to reappear, and our
-        // preferredScreenEdgesDeferringSystemGestures will also
-        // be suppressed (leading to possible errant exits of the
-        // stream).
-        return YES;
-    }
-    
-    return NO;
-}
-
-- (BOOL)shouldAutorotate {
-    return YES;
+    // Keep the stream immersive for touch, mouse, and controller users. UIKit
+    // will reveal the indicator during interaction and we explicitly yield the
+    // preference while the user is active.
+    return !_userIsInteracting;
 }
 
 - (BOOL)prefersPointerLocked {
-    // Pointer lock breaks the UIKit mouse APIs, which is a problem because
-    // GCMouse is horribly broken on iOS 14.0 for certain mice. Only lock
-    // the cursor if there is a GCMouse present.
-    return [GCMouse mice].count > 0;
+    // Presence alone is insufficient: Magic Keyboard trackpads can appear as
+    // GCMouse without delivering movement there. Lock only after observing a
+    // real relative-motion callback so UIKit hover remains a viable fallback.
+    return MoonlightHasRecentGCMouseMotion();
 }
 #endif
 
