@@ -1468,7 +1468,8 @@ enum {
                              accessibilityLabel:(NSString *)accessibilityLabel
                         accessibilityIdentifier:(NSString *)accessibilityIdentifier {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
-    button.frame = CGRectMake(0, 0, 48, 48);
+    const CGFloat diameter = 44.0;
+    button.frame = CGRectMake(0, 0, diameter, diameter);
     button.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     button.accessibilityLabel = accessibilityLabel;
     button.accessibilityIdentifier = accessibilityIdentifier;
@@ -1480,34 +1481,34 @@ enum {
     [button setImage:symbol forState:UIControlStateNormal];
     [button addTarget:self action:action forControlEvents:UIControlEventPrimaryActionTriggered];
 
+    UIVisualEffect *backgroundEffect;
     if (@available(iOS 26.0, *)) {
         UIGlassEffect *effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
         effect.interactive = YES;
         effect.tintColor = [UIColor colorWithRed:0.035 green:0.040 blue:0.055 alpha:0.82];
-
-        UIVisualEffectView *glassView = [[UIVisualEffectView alloc] initWithEffect:effect];
-        glassView.frame = CGRectMake(0, 0, 48, 48);
-        glassView.layer.cornerRadius = 24.0;
-        glassView.layer.cornerCurve = kCACornerCurveContinuous;
-        glassView.layer.masksToBounds = YES;
-        glassView.layer.borderWidth = 1.0;
-        glassView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.12].CGColor;
-        [glassView.contentView addSubview:button];
-        button.frame = glassView.contentView.bounds;
-        return glassView;
+        backgroundEffect = effect;
+    }
+    else {
+        backgroundEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark];
     }
 
-    UIVisualEffectView *materialView = [[UIVisualEffectView alloc]
-        initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark]];
-    materialView.frame = CGRectMake(0, 0, 48, 48);
-    materialView.layer.cornerRadius = 24.0;
-    materialView.layer.cornerCurve = kCACornerCurveContinuous;
-    materialView.layer.masksToBounds = YES;
-    materialView.layer.borderWidth = 1.0;
-    materialView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.13].CGColor;
-    [materialView.contentView addSubview:button];
-    button.frame = materialView.contentView.bounds;
-    return materialView;
+    UIVisualEffectView *glassView = [[UIVisualEffectView alloc] initWithEffect:backgroundEffect];
+    glassView.frame = CGRectMake(0, 0, diameter, diameter);
+    glassView.translatesAutoresizingMaskIntoConstraints = NO;
+    // Compact navigation bars otherwise compress the custom view to 48 by 44.
+    // Keep the glass and its hit target square in every bar size.
+    [NSLayoutConstraint activateConstraints:@[
+        [glassView.widthAnchor constraintEqualToConstant:diameter],
+        [glassView.heightAnchor constraintEqualToConstant:diameter],
+    ]];
+    glassView.layer.cornerRadius = diameter * 0.5;
+    glassView.layer.cornerCurve = kCACornerCurveCircular;
+    glassView.layer.masksToBounds = YES;
+    glassView.layer.borderWidth = 1.0;
+    glassView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.12].CGColor;
+    [glassView.contentView addSubview:button];
+    button.frame = glassView.contentView.bounds;
+    return glassView;
 }
 
 - (BOOL)browserControllerInputAvailable {
