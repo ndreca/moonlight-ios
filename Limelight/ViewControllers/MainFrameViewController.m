@@ -2336,9 +2336,9 @@ enum {
     cell.contentView.backgroundColor = UIColor.clearColor;
     cell.contentView.clipsToBounds = NO;
     cell.layer.masksToBounds = NO;
-    cell.exclusiveTouch = YES;
 
 #if !TARGET_OS_TV
+    cell.exclusiveTouch = YES;
     BOOL controllerHighlighted = [_browserControllerIndexPath isEqual:indexPath];
     if ([contentView isKindOfClass:[UIAppView class]]) {
         [(UIAppView *)contentView setControllerHighlighted:controllerHighlighted];
