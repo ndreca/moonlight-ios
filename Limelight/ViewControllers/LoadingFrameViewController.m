@@ -22,6 +22,7 @@
     self.view.accessibilityViewIsModal = YES;
 
 #if TARGET_OS_TV
+    UIBlurEffectStyle blurStyle = UIBlurEffectStyleDark;
     CGFloat cardWidth = 520.0;
     CGFloat cardHeight = 220.0;
     CGFloat cardCornerRadius = 28.0;
@@ -29,6 +30,7 @@
     CGFloat labelSpacing = 18.0;
     CGFloat labelFontSize = 30.0;
 #else
+    UIBlurEffectStyle blurStyle = UIBlurEffectStyleSystemChromeMaterialDark;
     CGFloat cardWidth = 230.0;
     CGFloat cardHeight = 112.0;
     CGFloat cardCornerRadius = 20.0;
@@ -37,7 +39,7 @@
     CGFloat labelFontSize = 16.0;
 #endif
 
-    UIBlurEffect *effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark];
+    UIBlurEffect *effect = [UIBlurEffect effectWithStyle:blurStyle];
     _loadingCard = [[UIVisualEffectView alloc] initWithEffect:effect];
     _loadingCard.translatesAutoresizingMaskIntoConstraints = NO;
     _loadingCard.layer.cornerRadius = cardCornerRadius;
